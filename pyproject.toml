@@ -1,0 +1,15 @@
+[project]
+name = "localscribe"
+version = "0.1.0"
+description = "Offline Windows app that transcribes and summarizes long audio files"
+requires-python = ">=3.10"
+
+[project.scripts]
+localscribe = "localscribe.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["localscribe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

@@ -1,0 +1,16 @@
+# Install into the `local-llm` conda env.
+# llama-cpp-python must come from the prebuilt CUDA wheel index, not PyPI (PyPI builds from source):
+#   pip install llama-cpp-python --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
+# CUDA runtime comes from conda:
+#   conda install -c conda-forge cuda-cudart=12.4 libcublas=12.4 cudnn=9
+# Audio decoding uses PyAV (pulled in by faster-whisper); no ffmpeg.exe needed.
+pyside6>=6.7
+faster-whisper>=1.1
+av>=12
+llama-cpp-python>=0.3.8
+numpy>=1.26
+psutil>=5.9
+huggingface_hub>=0.23
+
+# dev
+pytest>=8
