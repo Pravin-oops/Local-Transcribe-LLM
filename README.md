@@ -13,6 +13,20 @@ Pick a **content type** (Lecture → Summary + Study notes, Podcast → Summary,
 Story) or tick outputs yourself. Only the selected outputs are computed: a movie retelling never
 pays for study notes, and a summary-only run asks the LLM for fewer fields.
 
+**The main page** follows the system light/dark theme and keeps everything on one screen: a
+drag-and-drop zone (click it to browse), Ollama-style pickers for the **Transcribe model** and
+**LLM model** that list only models found on this computer (with their size; the menus also
+download another Whisper model, add a `.gguf` file, or open the models folder), content-type
+pills, output chips, the story's tone and length in **minutes of reading**, and the **total
+reading time** of everything selected (estimated before a run, measured from the files after).
+
+**Subtitle input**: drop an `.srt` or `.vtt` file instead of audio and transcription is skipped
+entirely; the subtitles become the transcript and go straight to the LLM (the Movie preset is
+selected by default, other outputs still work). Names written in the subtitles (`TOMAS: ...`,
+`[MARA] ...`) become speaker labels, dash dialogue is split into separate lines, and
+hearing-impaired sound cues such as `[thunder rumbling]` are kept as story context, never as
+dialogue. Speaker detection is unavailable for subtitles (it needs audio).
+
 - Transcription: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (`large-v3-turbo` by default) on the GPU, CPU fallback
 - Speakers ("who said what"): [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with pyannote segmentation-3.0 + TitaNet-small embeddings, ONNX on the CPU; no PyTorch, no account
 - Writing: any GGUF instruct model through [llama.cpp](https://github.com/abetlen/llama-cpp-python), split across GPU and CPU when it does not fit in VRAM
@@ -26,6 +40,7 @@ PySide6 window ──start/cancel──► worker process (spawned)
       └──── events via mp.Queue ◄─────┤
                                       ▼
   pipeline.run_job
+   0. subtitles   subtitles.py   .srt/.vtt input: parse and clean cues → segments, then skip to 4
    1. prepare     audio.py       PyAV decodes any audio/video → 16 kHz mono int16 PCM (memory-mapped)
                                  plan_chunks: ~10 min parts, cut at the quietest 0.5 s near each boundary
    2. transcribe  transcriber.py faster-whisper per part (VAD on), previous part's tail as prompt
@@ -53,13 +68,16 @@ rewrites only the script.
 | `localscribe/pipeline.py` | Orchestration, stages, resume logic, progress/ETA, GPU→CPU fallback |
 | `localscribe/audio.py` | Decoding (PyAV) and silence-aware chunk planning |
 | `localscribe/transcriber.py` | faster-whisper wrapper, hallucination and sound-tag filter |
+| `localscribe/subtitles.py` | `.srt`/`.vtt` input: encodings, markup, dash dialogue, names, sound cues |
 | `localscribe/diarizer.py` | Speaker detection (sherpa-onnx) and segment labelling |
 | `localscribe/summarizer.py` | llama.cpp backend, VRAM-aware layer offload, summary/notes map-reduce |
 | `localscribe/story.py` | Engaging Story: beats, outline, part-by-part narrator script |
 | `localscribe/prompts.py` | Prompts and JSON schemas |
 | `localscribe/config.py` | Settings, outputs, content-type presets, story tones and lengths |
 | `localscribe/jobs.py` | Job folders, manifest, atomic writes |
-| `localscribe/ui/` | Main window, output picker, settings dialog, worker-process bridge |
+| `localscribe/models.py` | Finds installed Whisper models (HF cache) and `.gguf` LLMs for the pickers |
+| `localscribe/estimates.py` | Reading-time estimates and measurements for the selected outputs |
+| `localscribe/ui/` | Main window, options panel, theme (light/dark), components, settings, worker bridge |
 | `localscribe/_win_dlls.py` | Windows DLL-search fixes for CUDA and Qt (see Troubleshooting) |
 
 ## Setup (conda env `local-llm`)
@@ -85,15 +103,18 @@ python -m localscribe                                   # desktop app
 python -m localscribe info                              # detected GPU/CPU and current settings
 python -m localscribe run lecture.mp3 --preset lecture  # summary + study notes
 python -m localscribe run episode.mp3 --preset podcast  # summary, speakers labelled
-python -m localscribe run film.mkv --preset movie --tone suspense --length medium
+python -m localscribe run film.mkv --preset movie --tone suspense --minutes 15
+python -m localscribe run film.srt --minutes 30         # story straight from subtitles, no Whisper
+python -m localscribe run course.vtt --outputs summary,notes
 python -m localscribe run talk.mp3 --outputs summary,story --speakers 2
 python -m localscribe run lecture.mp3 --transcript-only --chunk-minutes 15
 python -m localscribe run lecture.mp3 --resummarize     # redo all LLM outputs
 ```
 
 Story tones: `auto` (match the film), `suspense`, `epic`, `drama`, `comedy`, `dark`, `bedtime`,
-`documentary`. Lengths: `short` (~1,000 words), `medium` (~2,500), `long` (~5,000). With little
-source material the story comes out shorter rather than padded with invented events.
+`documentary`. Length: `--minutes N` of reading aloud (~165 words per minute; the app offers 5,
+10, 15, 20 and 30); `--length short|medium|long` still works as 5 / 15 / 30. With little source
+material the story comes out shorter rather than padded with invented events.
 
 Ctrl+C (CLI) or Cancel (app) stops after the current step; run again to resume.
 
@@ -106,8 +127,8 @@ python -m pytest -q
 ```
 
 The tests use fake Whisper/diarizer/LLM backends (`tests/fakes.py`) plus real audio decoding, and
-cover chunk planning, transcript formats, speaker labelling, field-selective map-reduce, story
-parts and caching, presets, cancel → resume, and cache invalidation.
+cover chunk planning, transcript formats, subtitle parsing, speaker labelling, field-selective
+map-reduce, story parts and caching, presets, cancel → resume, and cache invalidation.
 
 ## Troubleshooting
 

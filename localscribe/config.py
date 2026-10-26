@@ -30,12 +30,17 @@ STORY_TONES = {
     "documentary": "Documentary recap",
 }
 
-# Target length in words (spoken at ~165 words per minute).
-STORY_LENGTHS = {
-    "short": ("Short (~6 min read)", 1000),
-    "medium": ("Medium (~15 min read)", 2500),
-    "long": ("Long (~30 min read)", 5000),
-}
+# Story length is chosen as reading time; the story is written for reading aloud.
+STORY_MINUTES = (5, 10, 15, 20, 30)
+SPOKEN_WPM = 165
+_LEGACY_LENGTHS = {"short": 5, "medium": 15, "long": 30}  # v2 "story_length" values
+
+
+def story_minutes(value) -> int:
+    """Minutes from an int or a v2 length name ('short', 'medium', 'long')."""
+    if isinstance(value, str) and not value.isdigit():
+        return _LEGACY_LENGTHS.get(value, 15)
+    return max(1, int(value))
 
 
 def app_data_dir() -> Path:
@@ -68,7 +73,7 @@ class Settings:
     diarize: bool = False                                             # label speakers
     num_speakers: int = 0                                             # 0 = detect automatically
     story_tone: str = "auto"
-    story_length: str = "medium"
+    story_minutes: int = 15
 
     # Local LLM
     llm_path: str = ""            # GGUF instruct model
@@ -82,6 +87,8 @@ class Settings:
         data = dict(data)
         if "outputs" not in data and data.get("summarize") is False:  # v1 settings file
             data["outputs"] = []
+        if "story_minutes" not in data and "story_length" in data:  # v2 settings file
+            data["story_minutes"] = story_minutes(data["story_length"])
         known = {f.name for f in fields(cls)}
         settings = cls(**{k: v for k, v in data.items() if k in known})
         settings.outputs = [o for o in settings.outputs if o in OUTPUTS]

@@ -8,12 +8,14 @@ from localscribe.timefmt import hms, srt_time, vtt_time
 def group_segments(segments: list, max_span: float = 30.0, max_gap: float = 3.0) -> list:
     """Join consecutive segments into lines of up to ``max_span`` seconds.
 
-    A pause longer than ``max_gap`` or a change of speaker always starts a new
-    line. Returns dicts with start, end, text and (if labelled) speaker.
+    A pause longer than ``max_gap``, a change of speaker, or a subtitle cue
+    (each cue is a separate turn) always starts a new line. Returns dicts with
+    start, end, text and (if labelled) speaker.
     """
     lines = []
     for seg in segments:
-        if (lines and seg["start"] - lines[-1]["end"] <= max_gap
+        if (lines and not seg.get("cue")
+                and seg["start"] - lines[-1]["end"] <= max_gap
                 and seg["end"] - lines[-1]["start"] <= max_span
                 and seg.get("speaker") == lines[-1].get("speaker")):
             lines[-1]["end"] = seg["end"]

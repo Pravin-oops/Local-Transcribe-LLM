@@ -4,86 +4,94 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
-                               QPlainTextEdit, QProgressBar, QPushButton, QTabWidget, QTextBrowser,
-                               QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
+                               QProgressBar, QPushButton, QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
 
-from localscribe import audio
-from localscribe.config import OUTPUTS, load_settings, save_settings
+from localscribe import audio, models, subtitles
+from localscribe.config import OUTPUTS, load_settings, models_dir, save_settings
+from localscribe.estimates import reading_summary
 from localscribe.jobs import Job, read_json
 from localscribe.timefmt import hms
-from localscribe.ui.output_picker import OutputPicker
+from localscribe.ui import theme
+from localscribe.ui.options_panel import OptionsPanel
 from localscribe.ui.settings_dialog import SettingsDialog
-from localscribe.ui.worker import JobRunner
+from localscribe.ui.widgets import DropZone
+from localscribe.ui.worker import JobRunner, ModelDownload
 
-FILE_FILTER = "Audio and video ({});;All files (*)".format(
-    " ".join(f"*{ext}" for ext in audio.AUDIO_EXTENSIONS))
-
-
-class DropArea(QFrame):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setMinimumHeight(90)
-        self.setStyleSheet("DropArea { border: 2px dashed palette(mid); border-radius: 8px; }")
-        layout = QVBoxLayout(self)
-        self.title = QLabel("Drop an audio or video file here, or click Open file…")
-        self.title.setAlignment(Qt.AlignCenter)
-        font = self.title.font()
-        font.setPointSize(font.pointSize() + 2)
-        self.title.setFont(font)
-        self.detail = QLabel("")
-        self.detail.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.title)
-        layout.addWidget(self.detail)
+FILE_FILTER = "Audio, video and subtitles ({});;Subtitles ({});;All files (*)".format(
+    " ".join(f"*{ext}" for ext in audio.AUDIO_EXTENSIONS + subtitles.SUBTITLE_EXTENSIONS),
+    " ".join(f"*{ext}" for ext in subtitles.SUBTITLE_EXTENSIONS))
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("LocalScribe")
-        self.resize(1000, 720)
+        self.resize(1080, 940)
+        self.setMinimumSize(900, 760)
         self.setAcceptDrops(True)
         self.settings = load_settings()
         self.source = None
+        self.duration = None
         self.job_dir = None
         self.started_at = None
+        self.download = None
 
         self.runner = JobRunner(self)
         self.runner.event.connect(self._on_event)
         self.runner.finished.connect(self._on_finished)
 
-        self.drop = DropArea()
-        self.picker = OutputPicker(self.settings)
-        self.picker.changed.connect(self._outputs_changed)
+        # Header
+        title = QLabel("LocalScribe")
+        title.setObjectName("Title")
+        tagline = QLabel("Private, offline transcripts, notes and stories")
+        tagline.setObjectName("Muted")
+        self.settings_btn = QPushButton(theme.ICON_SETTINGS)
+        self.settings_btn.setObjectName("IconButton")
+        self.settings_btn.setToolTip("Settings")
+        self.settings_btn.setCursor(Qt.PointingHandCursor)
+        self.settings_btn.clicked.connect(self._open_settings)
+        header = QHBoxLayout()
+        header.addWidget(title, 0, Qt.AlignVCenter)
+        header.addSpacing(10)
+        header.addWidget(tagline, 0, Qt.AlignVCenter)
+        header.addStretch(1)
+        header.addWidget(self.settings_btn)
 
-        self.open_btn = QPushButton("Open file…")
+        # Drop zone and options
+        self.drop = DropZone()
+        self.drop.clicked.connect(self._choose_file)
+        self.panel = OptionsPanel(self.settings)
+        self.panel.changed.connect(self._outputs_changed)
+        self.panel.download_whisper.connect(self._download_whisper)
+        self.panel.add_llm.connect(self._add_llm)
+
+        # Actions and progress
         self.start_btn = QPushButton("Start")
+        self.start_btn.setObjectName("Primary")
+        self.start_btn.setCursor(Qt.PointingHandCursor)
         self.cancel_btn = QPushButton("Cancel")
-        self.settings_btn = QPushButton("Settings…")
-        self.folder_btn = QPushButton("Open output folder")
-        self.start_btn.setDefault(True)
-        self.open_btn.clicked.connect(self._choose_file)
+        self.folder_btn = QPushButton(f"{theme.ICON_FOLDER}")
+        self.folder_btn.setObjectName("IconButton")
+        self.folder_btn.setToolTip("Open the output folder")
         self.start_btn.clicked.connect(self._start)
         self.cancel_btn.clicked.connect(self._cancel)
-        self.settings_btn.clicked.connect(self._open_settings)
         self.folder_btn.clicked.connect(self._open_folder)
-
-        buttons = QHBoxLayout()
-        for b in (self.open_btn, self.start_btn, self.cancel_btn):
-            buttons.addWidget(b)
-        buttons.addStretch(1)
-        self.model_label = QLabel()
-        buttons.addWidget(self.model_label)
-        buttons.addWidget(self.settings_btn)
-        buttons.addWidget(self.folder_btn)
-
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setTextVisible(False)
-        self.status = QLabel("Ready")
+        self.status = QLabel("Choose a file to begin")
+        self.status.setObjectName("Muted")
+        actions = QHBoxLayout()
+        actions.setSpacing(10)
+        actions.addWidget(self.start_btn)
+        actions.addWidget(self.cancel_btn)
+        actions.addSpacing(8)
+        actions.addWidget(self.status, 1)
+        actions.addWidget(self.folder_btn)
 
-        mono = QFont("Consolas")
+        # Results
+        mono = QFont("Cascadia Mono")
         mono.setStyleHint(QFont.Monospace)
         self.transcript = QPlainTextEdit(readOnly=True)
         self.transcript.setFont(mono)
@@ -92,23 +100,27 @@ class MainWindow(QMainWindow):
         self.log = QPlainTextEdit(readOnly=True)
         self.log.setFont(mono)
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(False)
         self.tabs.addTab(self.transcript, "Transcript")
         for key, label in OUTPUTS.items():
             self.tabs.addTab(self.views[key], label)
         self.tabs.addTab(self.log, "Log")
 
-        central = QWidget()
-        layout = QVBoxLayout(central)
+        page = QWidget()
+        page.setObjectName("Page")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(26, 20, 26, 22)
+        layout.setSpacing(14)
+        layout.addLayout(header)
         layout.addWidget(self.drop)
-        layout.addWidget(self.picker)
-        layout.addLayout(buttons)
+        layout.addWidget(self.panel)
+        layout.addLayout(actions)
         layout.addWidget(self.progress)
-        layout.addWidget(self.status)
         layout.addWidget(self.tabs, 1)
-        self.setCentralWidget(central)
+        self.setCentralWidget(page)
 
-        self._refresh_model_label()
         self._refresh_tabs()
+        self._update_reading()
         self._set_busy(False)
 
     # ------------------------------------------------------------------ file selection
@@ -116,11 +128,16 @@ class MainWindow(QMainWindow):
     def dragEnterEvent(self, event):
         if not self.runner.is_running() and self._dropped_file(event):
             event.acceptProposedAction()
+            self.drop.set_active(True)
+
+    def dragLeaveEvent(self, event):
+        self.drop.set_active(False)
 
     def dropEvent(self, event):
+        self.drop.set_active(False)
         path = self._dropped_file(event)
         if path:
-            self._set_source(path)
+            self._open_source(path)
 
     @staticmethod
     def _dropped_file(event):
@@ -132,28 +149,50 @@ class MainWindow(QMainWindow):
         return None
 
     def _choose_file(self):
+        if self.runner.is_running():
+            return
         start = str(self.source.parent) if self.source else str(Path.home())
-        path, _ = QFileDialog.getOpenFileName(self, "Choose audio or video", start, FILE_FILTER)
+        path, _ = QFileDialog.getOpenFileName(self, "Choose audio, video or subtitles", start, FILE_FILTER)
         if path:
-            self._set_source(Path(path))
+            self._open_source(Path(path))
+
+    def _open_source(self, path: Path):
+        """A file the user just picked; subtitles default to the Movie / Engaging Story preset."""
+        if subtitles.is_subtitle(path) and self.settings.content_type != "movie":
+            self.settings.apply_preset("movie")
+            self.panel.load(self.settings)
+            save_settings(self.settings)
+        self._set_source(path)
 
     def _set_source(self, path: Path):
         self.source = path
-        self.drop.title.setText(path.name)
-        duration = audio.probe_duration(path)
-        parts = [f"Duration {hms(duration)}" if duration else "Duration unknown",
-                 f"{path.stat().st_size / 2**20:.0f} MB"]
+        is_subs = subtitles.is_subtitle(path)
+        if is_subs:  # the subtitles are the transcript: no audio for Whisper or speaker detection
+            segs = None
+            try:
+                segs = subtitles.load(path)
+            except (OSError, subtitles.SubtitleError):
+                pass
+            self.duration = segs[-1]["end"] if segs else None
+            parts = ["Subtitles", subtitles.describe(path), "transcription skipped"]
+        else:
+            self.duration = audio.probe_duration(path)
+            parts = [hms(self.duration) if self.duration else "Duration unknown",
+                     f"{path.stat().st_size / 2**20:.0f} MB"]
+        self.panel.set_audio_available(not is_subs)
         resume = self._resume_hint(path)
         if resume:
             parts.append(resume)
-        self.drop.detail.setText(" · ".join(parts))
+        self.drop.set_file(path.name, " · ".join(parts))
         self._load_existing_outputs(path)
+        self.status.setText("Ready to start")
+        self._update_reading()
         self._set_busy(False)
 
     def _resume_hint(self, path: Path) -> str:
         root = Job.root_for(path, Path(self.settings.output_dir))
         manifest = read_json(root / "manifest.json")
-        if not manifest or not manifest.get("chunks"):
+        if not manifest:
             return ""
         if manifest.get("stages", {}).get("transcribed"):
             done = manifest.get("outputs_done", {})
@@ -161,6 +200,8 @@ class MainWindow(QMainWindow):
             if not missing:
                 return "Already processed: results loaded below"
             return f"Transcript ready: Start will add {', '.join(missing)}"
+        if not manifest.get("chunks"):
+            return ""
         parts = sum(1 for i in range(len(manifest["chunks"])) if (root / "parts" / f"{i:04d}.json").exists())
         return f"Earlier progress found: {parts}/{len(manifest['chunks'])} parts done, Start will resume"
 
@@ -180,10 +221,10 @@ class MainWindow(QMainWindow):
             choice = QMessageBox.question(
                 self, "No LLM model",
                 "No LLM model is selected, so only the transcript will be created.\n\n"
-                "Choose a GGUF model in Settings first?",
+                "Add a .gguf model first?",
                 QMessageBox.Yes | QMessageBox.No)
             if choice == QMessageBox.Yes:
-                self._open_settings()
+                self._add_llm()
                 return
         self.transcript.clear()
         for view in self.views.values():
@@ -202,9 +243,10 @@ class MainWindow(QMainWindow):
 
     def _set_busy(self, busy: bool):
         self.start_btn.setEnabled(not busy and self.source is not None)
-        self.open_btn.setEnabled(not busy)
+        self.drop.setEnabled(not busy)
         self.settings_btn.setEnabled(not busy)
-        self.picker.setEnabled(not busy)
+        self.panel.setEnabled(not busy)
+        self.cancel_btn.setVisible(busy)
         self.cancel_btn.setEnabled(busy)
         self.folder_btn.setEnabled(self.job_dir is not None)
 
@@ -228,8 +270,9 @@ class MainWindow(QMainWindow):
         elif kind == "done":
             self.progress.setValue(1000)
             took = hms(time.monotonic() - self.started_at) if self.started_at else ""
-            self.status.setText(f"Done in {took}. Files are in the output folder.")
+            self.status.setText(f"Done in {took}")
             self._show_outputs(Path(ev["job_dir"]))
+            self._update_reading()
             for key in ("story", "summary", "notes"):  # most specific output first
                 if key in self.settings.outputs and (Path(ev["job_dir"]) / f"{key}.md").exists():
                     self.tabs.setCurrentWidget(self.views[key])
@@ -267,27 +310,64 @@ class MainWindow(QMainWindow):
             exists = self.job_dir is not None and (Path(self.job_dir) / f"{key}.md").exists()
             self.tabs.setTabVisible(self.tabs.indexOf(view), key in self.settings.outputs or exists)
 
+    def _update_reading(self):
+        self.panel.set_reading(reading_summary(self.settings.outputs, self.duration,
+                                               self.settings.story_minutes, self.job_dir))
+
+    # ------------------------------------------------------------------ models
+
+    def _download_whisper(self, name: str):
+        mb = models.WHISPER_CATALOG[name][1]
+        choice = QMessageBox.question(
+            self, "Download Whisper model",
+            f"Download '{name}' ({models.pretty_size(mb * 1_000_000)}) from Hugging Face?\n\n"
+            "This happens once; the model then works offline.")
+        if choice != QMessageBox.Yes:
+            return
+        self.panel.whisper.set_busy(f"Downloading {name}…")
+        self.status.setText(f"Downloading Whisper model {name}…")
+        self.download = ModelDownload(name, self)
+        self.download.done.connect(self._download_done)
+        self.download.failed.connect(self._download_failed)
+        self.download.start()
+
+    def _download_done(self, name: str):
+        self.settings.whisper_model = name
+        save_settings(self.settings)
+        self.panel.refresh_models(self.settings)
+        self.status.setText(f"Whisper model {name} is ready")
+
+    def _download_failed(self, name: str, error: str):
+        self.panel.refresh_models(self.settings)
+        self.status.setText(f"Download of {name} failed")
+        QMessageBox.warning(self, "Download failed", f"Could not download '{name}':\n\n{error}")
+
+    def _add_llm(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Add an LLM model", str(models_dir()), "GGUF models (*.gguf)")
+        if path:
+            self.settings.llm_path = path
+            save_settings(self.settings)
+            self.panel.refresh_models(self.settings)
+
     # ------------------------------------------------------------------ settings & misc
 
     def _outputs_changed(self):
-        self.picker.apply_to(self.settings)
+        self.panel.apply_to(self.settings)
         save_settings(self.settings)
         self._refresh_tabs()
         if self.source:
             self._set_source(self.source)
+        else:
+            self._update_reading()
 
     def _open_settings(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec():
             self.settings = dialog.result_settings()
             save_settings(self.settings)
-            self._refresh_model_label()
+            self.panel.refresh_models(self.settings)
             if self.source:
                 self._set_source(self.source)
-
-    def _refresh_model_label(self):
-        llm = Path(self.settings.llm_path).stem if self.settings.llm_path else "none"
-        self.model_label.setText(f"Whisper: {self.settings.whisper_model}  ·  LLM: {llm}")
 
     def _open_folder(self):
         if self.job_dir and Path(self.job_dir).exists():

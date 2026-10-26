@@ -6,7 +6,7 @@ built from only the fields the selected outputs need.
 """
 
 # Bump when prompts or schemas change, so cached per-block results are regenerated.
-VERSION = 8
+VERSION = 10
 
 SYSTEM = (
     "You are a careful note-taker who turns spoken English transcripts (lectures, talks, "
@@ -16,6 +16,8 @@ SYSTEM = (
 
 SPEAKER_NOTE = ("Lines may start with a speaker label such as 'Speaker 2:'; use names from the "
                 "dialogue instead of labels when they are clear.")
+SOUND_NOTE = ("Text in square brackets, such as [thunder rumbling] or [door slams], describes sounds, "
+              "not speech: use it as a clue to what is happening, never as dialogue.")
 
 _STRING_LIST = {"type": "array", "items": {"type": "string"}}
 _CONCEPTS = {
@@ -81,7 +83,7 @@ def map_prompt(lines_text: str, start: str, end: str, part: int, total: int, min
     }
     asked = "\n".join(instructions[f] for f in fields)
     return f"""Transcript excerpt {part} of {total}, covering {start} to {end} ({minutes:.0f} minutes).
-Each line begins with its [HH:MM:SS] timestamp. {SPEAKER_NOTE}
+Each line begins with its [HH:MM:SS] timestamp. {SPEAKER_NOTE} {SOUND_NOTE}
 
 <transcript>
 {lines_text}
@@ -175,8 +177,8 @@ def tone_style(tone: str, genre: str) -> str:
 def beats_prompt(lines_text: str, start: str, end: str, part: int, total: int, minutes: float) -> str:
     n_events = max(6, round(minutes * 3))
     return f"""Transcript excerpt {part} of {total} of a film's audio, covering {start} to {end} ({minutes:.0f} minutes).
-Only the spoken dialogue was transcribed; nothing describes what is seen, so infer the action from what is said.
-Each line begins with its [HH:MM:SS] timestamp. Lines may start with a speaker label such as 'Speaker 2:'.
+Mostly dialogue was captured; little or nothing describes what is seen, so infer the action from what is said.
+Each line begins with its [HH:MM:SS] timestamp. Lines may start with a speaker label such as 'Speaker 2:' or a name. {SOUND_NOTE}
 
 <transcript>
 {lines_text}
@@ -235,7 +237,7 @@ The previous part ended with: "{previous_tail or "(nothing yet)"}"
 Events to narrate in this part, in order:
 {events}
 
-Dialogue spoken during this part, in order:
+Dialogue spoken during this part, in order (when no name is given, work out who is speaking from the context):
 {lines or "(none)"}
 
 Write about {words} words of narrator script for this part. {opening} {closing}

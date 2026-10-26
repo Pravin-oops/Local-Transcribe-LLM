@@ -22,7 +22,7 @@ def test_dialogue_lines_credit_resolved_names_and_thin_evenly():
              "speaker": "Speaker 1" if i % 2 else "Speaker 2"} for i in range(100)]
     text = dialogue_lines(segs, {"Speaker 1": "Elena"}, 10, 60, keep={57.0}, limit=6)
     lines = text.splitlines()
-    assert len(lines) == 6 and lines[0].startswith('- Someone said: "line number 10')  # unnamed
+    assert len(lines) == 6 and lines[0].startswith('- "line number 10')  # unnamed: plain quote
     assert '- Elena said: "line number 57 here"' in lines                             # kept
     assert all(10 <= int(l.split("number ")[1].split()[0]) < 60 for l in lines)
 
@@ -48,6 +48,18 @@ def test_clean_script_turns_screenplay_lines_into_narration():
         'She spoke up: "Wait. The lamp is flickering."'
     grim = "Tomas's expression turns grim: \"Light them and set them in front of the big mirror.\""
     assert clean_script(grim) == grim
+    # Real output from the subtitle run: the writer copied an old "Someone said:" prefix.
+    assert clean_script('someone said: "The cargo ship from the north."') == '"The cargo ship from the north."'
+
+
+def test_dialogue_lines_skip_sound_cues_and_credit_subtitle_names():
+    segs = [{"start": 1.0, "end": 2.0, "text": "[thunder rumbling in the distance]", "sound": True},
+            {"start": 3.0, "end": 4.0, "text": "The radio is right tonight.", "speaker": "Tomas"},
+            {"start": 5.0, "end": 6.0, "text": "Show me the lamp room.", "speaker": "Speaker 2"}]
+    assert dialogue_lines(segs, {}, 0, 10, keep=set()).splitlines() == [
+        '- Tomas said: "The radio is right tonight."',
+        '- "Show me the lamp room."',
+    ]
 
 
 def test_drop_repeats_removes_restated_ending():
@@ -59,20 +71,20 @@ def test_drop_repeats_removes_restated_ending():
 def test_story_parts_follow_length_and_resume(tmp_path):
     job = Job(tmp_path)
     backend = FakeBackend(n_ctx=3600)
-    story = write_story(fake_segments(400), backend, job, "film", "suspense", "long", lambda f, m: None)
-    assert backend.calls.count("part") == 8 and backend.calls.count("outline") == 1
+    story = write_story(fake_segments(400), backend, job, "film", "suspense", 30, lambda f, m: None)
+    assert backend.calls.count("part") == 9 and backend.calls.count("outline") == 1
     assert story["title"] == "The Long Night" and story["genre"] == "thriller"
     assert story["tone"] == "Suspense / thriller"
     assert [p["heading"] for p in story["parts"]][:2] == ["Chapter 1 Title", "Chapter 2 Title"]
     assert all("Here you go" not in p["text"] for p in story["parts"])
 
     again = FakeBackend(n_ctx=3600)
-    write_story(fake_segments(400), again, job, "film", "suspense", "long", lambda f, m: None)
+    write_story(fake_segments(400), again, job, "film", "suspense", 30, lambda f, m: None)
     assert again.calls == []  # beats, outline and every part come from story/*.json
 
     retone = FakeBackend(n_ctx=3600)
-    write_story(fake_segments(400), retone, job, "film", "bedtime", "long", lambda f, m: None)
-    assert retone.calls == ["part"] * 8  # a new tone rewrites the script only
+    write_story(fake_segments(400), retone, job, "film", "bedtime", 30, lambda f, m: None)
+    assert retone.calls == ["part"] * 9  # a new tone rewrites the script only
 
 
 def test_render_story():

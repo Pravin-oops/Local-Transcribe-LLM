@@ -4,7 +4,8 @@ import sys
 import threading
 
 from localscribe import __version__
-from localscribe.config import OUTPUTS, PRESETS, STORY_LENGTHS, STORY_TONES, load_settings
+from localscribe.config import OUTPUTS, PRESETS, STORY_TONES, load_settings, story_minutes
+from localscribe.subtitles import is_subtitle
 from localscribe.timefmt import hms
 from localscribe.transcriber import Cancelled
 
@@ -32,10 +33,14 @@ def _cmd_run(args) -> int:
     settings = load_settings()
     if args.preset:
         settings.apply_preset(args.preset)
+    elif args.outputs is None and is_subtitle(args.file):
+        settings.apply_preset("movie")  # subtitles default to the Engaging Story
+        print("Subtitle file: using the movie preset (Engaging Story); pass --outputs to change.")
     for attr, value in (("whisper_model", args.whisper_model), ("llm_path", args.llm),
                         ("chunk_minutes", args.chunk_minutes), ("output_dir", args.output),
                         ("device", args.device), ("batch_size", args.batch_size),
-                        ("story_tone", args.tone), ("story_length", args.length),
+                        ("story_tone", args.tone),
+                        ("story_minutes", story_minutes(args.length) if args.length else args.minutes),
                         ("num_speakers", args.speakers), ("diarize", args.diarize)):
         if value is not None:
             setattr(settings, attr, value)
@@ -83,14 +88,16 @@ def main(argv=None) -> int:
     sub.add_parser("gui", help="open the desktop app (default)")
     sub.add_parser("info", help="show detected hardware and settings")
     run = sub.add_parser("run", help="transcribe one file and produce the selected outputs")
-    run.add_argument("file")
+    run.add_argument("file", help="audio/video file, or .srt/.vtt subtitles (skips transcription)")
     run.add_argument("--preset", choices=list(PRESETS),
                      help="lecture = summary + notes, podcast = summary, movie = Engaging Story")
     run.add_argument("--outputs", help=f"comma-separated, any of: {','.join(OUTPUTS)}")
     run.add_argument("--transcript-only", "--no-summary", action="store_true",
                      help="skip all LLM outputs")
     run.add_argument("--tone", choices=list(STORY_TONES), help="Engaging Story narration tone")
-    run.add_argument("--length", choices=list(STORY_LENGTHS), help="Engaging Story length")
+    run.add_argument("--minutes", type=int, help="Engaging Story length as reading time in minutes")
+    run.add_argument("--length", choices=["short", "medium", "long"],
+                     help="shortcut for --minutes 5 / 15 / 30")
     run.add_argument("--diarize", action=argparse.BooleanOptionalAction, default=None,
                      help="label speakers (on by default for podcast and movie presets)")
     run.add_argument("--speakers", type=int, help="number of speakers, 0 = detect")

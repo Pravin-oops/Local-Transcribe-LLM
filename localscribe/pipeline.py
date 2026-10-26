@@ -19,7 +19,8 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from localscribe import audio, hardware, prompts
+from localscribe import audio, hardware, prompts, subtitles
+from localscribe.subtitles import is_subtitle
 from localscribe.config import OUTPUTS, Settings
 from localscribe.jobs import Job, read_json, write_json_atomic
 from localscribe.merger import write_transcripts
@@ -100,7 +101,11 @@ def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = F
         raise FileNotFoundError(f"Audio file not found: {source}")
     outputs = [o for o in OUTPUTS if o in settings.outputs]
     use_llm = bool(outputs and settings.llm_path)
-    stages = ["prepare", "transcribe"] + (["diarize"] if settings.diarize else [])
+    from_subtitles = is_subtitle(source)
+    if from_subtitles:  # the subtitles are the transcript: no audio, Whisper or diarizer
+        stages = ["prepare"]
+    else:
+        stages = ["prepare", "transcribe"] + (["diarize"] if settings.diarize else [])
     if use_llm:
         stages += (["summarize"] if {"summary", "notes"} & set(outputs) else []) + \
                   (["story"] if "story" in outputs else [])
@@ -110,12 +115,15 @@ def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = F
     emit({"type": "job", "job_dir": str(job.root)})
     report.log(f"Job started for {source} (outputs: {', '.join(outputs) or 'transcript only'})")
 
-    _prepare(job, source, settings, report, cancel)
-    segments = _transcribe(job, settings, report, emit, cancel,
-                           transcriber_factory or _default_transcriber)
-    if settings.diarize:
-        segments = _diarize(job, segments, settings, report, cancel,
-                            diarizer_factory or _default_diarizer)
+    if from_subtitles:
+        segments = _read_subtitles(job, source, settings, report, emit)
+    else:
+        _prepare(job, source, settings, report, cancel)
+        segments = _transcribe(job, settings, report, emit, cancel,
+                               transcriber_factory or _default_transcriber)
+        if settings.diarize:
+            segments = _diarize(job, segments, settings, report, cancel,
+                                diarizer_factory or _default_diarizer)
     files = write_transcripts(segments, job.root)
     job.set_stage("transcribed", True)
     report.log(f"Transcript written: {len(segments)} segments")
@@ -130,6 +138,20 @@ def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = F
     report.log("Job finished")
     emit(result)
     return result
+
+
+def _read_subtitles(job: Job, source: Path, settings: Settings, report: _Reporter, emit) -> list:
+    report.progress("prepare", 0.0, f"Reading subtitles {source.name}")
+    segments = subtitles.load(source)
+    job.update_manifest(source_type="subtitles", duration=segments[-1]["end"])
+    spoken = sum(1 for s in segments if not s.get("sound"))
+    report.log(f"Subtitles: {spoken} spoken lines, {len(segments) - spoken} sound cues, "
+               f"{hms(segments[-1]['end'])}; transcription skipped")
+    if settings.diarize:
+        report.log("Speaker detection needs audio; using speaker names written in the subtitles instead")
+    emit({"type": "segments", "items": segments})
+    report.progress("prepare", 1.0, "Subtitles loaded")
+    return segments
 
 
 def _prepare(job: Job, source: Path, settings: Settings, report: _Reporter, cancel) -> None:
@@ -281,7 +303,7 @@ def _llm_outputs(job: Job, source: Path, segments: list, settings: Settings, out
     base = {"model": llm_path.stem, "prompts": prompts.VERSION,
             "transcript": hashlib.sha1(basis.encode("utf-8")).hexdigest()[:12]}
     configs = {"summary": base, "notes": base,
-               "story": {**base, "tone": settings.story_tone, "length": settings.story_length}}
+               "story": {**base, "tone": settings.story_tone, "minutes": settings.story_minutes}}
     if resummarize:
         _invalidate_outputs(job)
     done = job.load_manifest().get("outputs_done", {})
@@ -301,10 +323,12 @@ def _llm_outputs(job: Job, source: Path, segments: list, settings: Settings, out
     report.progress("summarize" if text_outputs else "story", 0.0, f"Loading LLM {llm_path.stem}")
     backend = factory(settings, report.log)
     report.log(f"LLM {backend.name}: context {backend.n_ctx}, GPU layers {getattr(backend, 'gpu_layers', '?')}")
-    duration = job.load_manifest().get("duration", 0)
+    manifest = job.load_manifest()
+    duration = manifest.get("duration", 0)
+    basis = ("From subtitles" if manifest.get("source_type") == "subtitles"
+             else f"Transcribed with {settings.whisper_model}")
     # *...* rather than _..._: model names like Q4_K_M contain underscores.
-    header = (f"# {source.stem}\n\n*Duration {hms(duration)} · Transcribed with "
-              f"{settings.whisper_model} · Written by {backend.name}*\n\n")
+    header = f"# {source.stem}\n\n*Duration {hms(duration)} · {basis} · Written by {backend.name}*\n\n"
 
     def finish(output: str, text: str, t0: float) -> None:
         job.output(f"{output}.md").write_text(text, encoding="utf-8")
@@ -324,7 +348,7 @@ def _llm_outputs(job: Job, source: Path, segments: list, settings: Settings, out
         if "story" in pending:
             t0 = time.monotonic()
             story = write_story(segments, backend, job, source.stem, settings.story_tone,
-                                settings.story_length, lambda f, m: report.progress("story", f, m),
+                                settings.story_minutes, lambda f, m: report.progress("story", f, m),
                                 cancel, report.warn)
             source_line = f"Retold from {source.name} ({hms(duration)}) by {backend.name}"
             finish("story", render_story(story, source_line), t0)

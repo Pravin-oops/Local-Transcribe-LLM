@@ -15,7 +15,7 @@ Every step is cached, so a cancelled story resumes where it stopped.
 import re
 
 from localscribe import prompts
-from localscribe.config import STORY_LENGTHS, STORY_TONES
+from localscribe.config import SPOKEN_WPM, STORY_TONES
 from localscribe.jobs import read_json, write_json_atomic
 from localscribe.summarizer import (PROMPT_OVERHEAD_TOKENS, block_key, complete_structured, digest,
                                     format_line, transcript_blocks)
@@ -23,10 +23,16 @@ from localscribe.timefmt import hms, parse_hms
 
 BEATS_OUTPUT_TOKENS = 1800  # ~36 one-sentence events for a full ~12 min block
 OUTLINE_OUTPUT_TOKENS = 900
-PARTS = {"short": 3, "medium": 5, "long": 8}
 # Longest part one call writes (~1,700 tokens) while the prompt still fits 8k.
 # With fewer events than parts the story comes out shorter rather than padded.
 MAX_PART_WORDS = 900
+
+
+def story_plan(minutes: int):
+    """(total words, number of parts) for a story read aloud in ``minutes``:
+    3 parts up to ~10 min, then one part per ~550 words, at most 10."""
+    words = minutes * SPOKEN_WPM
+    return words, max(3, min(10, round(words / 550)))
 _LABEL = re.compile(r"\bSpeaker \d+\b")
 
 
@@ -49,8 +55,9 @@ def quote_time(quote: str, segments: list):
     if not words:
         return None
     best, score = None, 0.0
-    for i, seg in enumerate(segments):
-        window = set(_norm_words(" ".join(s["text"] for s in segments[i:i + 2])))
+    spoken = [s for s in segments if not s.get("sound")]
+    for i, seg in enumerate(spoken):
+        window = set(_norm_words(" ".join(s["text"] for s in spoken[i:i + 2])))
         overlap = len(words & window) / len(words)
         if overlap > score:
             best, score = seg["start"], overlap
@@ -123,6 +130,7 @@ def clean_script(text: str) -> str:
             else:
                 line = f'"{quote}"'
         line = _INLINE_CREDIT.sub("", re.sub(r"\bSpeaker \d+:\s*", "", line))
+        line = re.sub(r"(?i)^(\s*)someone said:\s*", r"\1", line)  # copied "Someone said:" prefix
         out.append(_LABEL.sub("someone", line))
     return "\n".join(out).strip()
 
@@ -131,15 +139,22 @@ def dialogue_lines(segments: list, names: dict, lo: float, hi: float, keep: set,
                    limit: int = 20) -> str:
     """The dialogue spoken in [lo, hi), credited to resolved names, thinned evenly
     to ``limit`` lines (always keeping the memorable lines whose times are in ``keep``)."""
-    span = [s for s in segments if lo <= s["start"] < hi and len(s["text"].split()) >= 3]
+    span = [s for s in segments
+            if lo <= s["start"] < hi and not s.get("sound") and len(s["text"].split()) >= 3]
     if len(span) > limit:
         must = [s for s in span if s["start"] in keep]
         rest = [s for s in span if s["start"] not in keep]
         step = len(rest) / max(1, limit - len(must))
         span = sorted(must + [rest[int(i * step)] for i in range(limit - len(must))],
                       key=lambda s: s["start"])
-    # Written as prose ('Tomas said: "..."') because the writer imitates the format.
-    return "\n".join(f"- {names.get(s.get('speaker', ''), 'Someone')} said: \"{s['text']}\"" for s in span)
+    def line(s):
+        label = s.get("speaker") or ""
+        name = names.get(label) if _LABEL.fullmatch(label) else label  # subtitle names are real
+        # Written as prose ('Tomas said: "..."') because the writer imitates the format;
+        # an unknown speaker is left for the writer to infer from context.
+        return f"- {name} said: \"{s['text']}\"" if name else f"- \"{s['text']}\""
+
+    return "\n".join(line(s) for s in span)
 
 
 def drop_repeats(text: str, previous: str) -> str:
@@ -164,14 +179,14 @@ def _fit_events(events: list, count_tokens, budget: int) -> str:
     return "\n".join(lines)
 
 
-def write_story(segments: list, backend, job, title: str, tone: str, length: str, on_progress,
+def write_story(segments: list, backend, job, title: str, tone: str, minutes: int, on_progress,
                 cancel=None, warn=print):
-    """Build the Engaging Story for ``segments``; returns a dict for :func:`render_story`."""
+    """Build the Engaging Story for ``segments``, sized to be read aloud in about
+    ``minutes``; returns a dict for :func:`render_story`."""
     blocks = transcript_blocks(segments, backend, BEATS_OUTPUT_TOKENS)
     if not blocks:
         return None
-    n_parts = PARTS.get(length, PARTS["medium"])
-    total_words = STORY_LENGTHS.get(length, STORY_LENGTHS["medium"])[1]
+    total_words, n_parts = story_plan(minutes)
     steps = len(blocks) + 1 + n_parts
     story_dir = job.output("story")
 
@@ -186,9 +201,9 @@ def write_story(segments: list, backend, job, title: str, tone: str, length: str
         else:
             message = f"Following the story, part {i + 1}/{len(blocks)}"
             on_progress(i / steps, message)
-            minutes = (block[-1]["end"] - block[0]["start"]) / 60
+            block_minutes = (block[-1]["end"] - block[0]["start"]) / 60
             user = prompts.beats_prompt("\n".join(format_line(l) for l in block), hms(block[0]["start"]),
-                                        hms(block[-1]["end"]), i + 1, len(blocks), minutes)
+                                        hms(block[-1]["end"]), i + 1, len(blocks), block_minutes)
             data = complete_structured(backend, user, prompts.BEATS_SCHEMA, BEATS_OUTPUT_TOKENS, cancel,
                                        lambda n: on_progress(i / steps, f"{message} ({n} tokens)"),
                                        warn, system=prompts.STORY_SYSTEM) or {}
@@ -248,7 +263,7 @@ def write_story(segments: list, backend, job, title: str, tone: str, length: str
     parts, previous_tail, previous_body = [], "", ""
     for k, group in enumerate(groups):
         path = story_dir / f"part_{k:02d}.json"
-        key = {"model": backend.name, "prompts": prompts.VERSION, "tone": tone, "length": length,
+        key = {"model": backend.name, "prompts": prompts.VERSION, "tone": tone, "minutes": minutes,
                "parts": len(groups), "title": story_title, "previous": digest(previous_tail),
                "events": digest("\n".join(f"{e['start']} {e['event']}" for e in group))}
         cached = read_json(path)
@@ -287,7 +302,7 @@ def write_story(segments: list, backend, job, title: str, tone: str, length: str
 def render_story(story: dict, source_line: str) -> str:
     if not story:
         return "# Engaging Story\n\n*The story could not be generated.*\n"
-    minutes = max(1, round(story["words"] / 165))
+    minutes = max(1, round(story["words"] / SPOKEN_WPM))
     tone = story["tone"] if story["tone"] != STORY_TONES["auto"] else "matched to the film"
     out = [f"# {story['title']}", ""]
     if story["logline"]:

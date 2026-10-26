@@ -8,9 +8,27 @@ stopped job resumes on the next Start.
 import multiprocessing as mp
 import queue
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
 from localscribe.pipeline import process_main
+
+
+class ModelDownload(QThread):
+    """Downloads a Whisper model into the Hugging Face cache off the UI thread."""
+    done = Signal(str)
+    failed = Signal(str, str)
+
+    def __init__(self, name: str, parent=None):
+        super().__init__(parent)
+        self.name = name
+
+    def run(self):
+        try:
+            from faster_whisper import download_model
+            download_model(self.name)
+            self.done.emit(self.name)
+        except Exception as exc:  # network, disk space, ...
+            self.failed.emit(self.name, str(exc))
 
 TERMINAL = ("done", "error", "cancelled")
 FORCE_STOP_MS = 20_000

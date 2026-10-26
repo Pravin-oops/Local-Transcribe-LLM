@@ -1,4 +1,4 @@
-﻿"""End-to-end pipeline run with real ffmpeg decoding and fake models."""
+"""End-to-end pipeline run with real ffmpeg decoding and fake models."""
 import threading
 import wave
 
@@ -86,7 +86,7 @@ def test_lecture_preset_writes_summary_and_notes_and_rerun_skips_work(wav_file, 
 def test_movie_preset_detects_speakers_and_writes_only_the_story(wav_file, tmp_path):
     settings = _settings(tmp_path, llm_path=_model(tmp_path))
     settings.apply_preset("movie")
-    settings.story_length = "short"
+    settings.story_minutes = 5
     backend, diarized = FakeBackend(), []
     result = run_job(wav_file, settings, lambda e: None,
                      transcriber_factory=lambda *a: FakeTranscriber([]),
@@ -100,17 +100,17 @@ def test_movie_preset_detects_speakers_and_writes_only_the_story(wav_file, tmp_p
     assert "Speaker 1:" in transcript and "Speaker 2:" in transcript
     assert len(diarized) == 1
 
-    assert backend.part_words == [333, 333, 333]
+    assert backend.part_words == [275, 275, 275]
 
     # Speakers and beats are cached: a longer story only rewrites the parts. With
     # just 3 scenes in 3 minutes of audio it keeps 3 parts, each longer, capped
     # rather than padded with invented events.
-    settings.story_length = "medium"
+    settings.story_minutes = 15
     longer = FakeBackend()
     run_job(wav_file, settings, lambda e: None, transcriber_factory=lambda *a: FakeTranscriber([]),
             backend_factory=lambda *a: longer, diarizer_factory=fake_diarizer(diarized))
     assert len(diarized) == 1 and "beats" not in longer.calls
-    assert longer.part_words == [833, 833, 833]
+    assert longer.part_words == [825, 825, 825]
 
     # Different speaker labels change the transcript, so the story is redone even
     # though model, tone and length are unchanged. Caches key on content: the
@@ -122,6 +122,33 @@ def test_movie_preset_detects_speakers_and_writes_only_the_story(wav_file, tmp_p
     run_job(wav_file, settings, lambda e: None, transcriber_factory=lambda *a: FakeTranscriber([]),
             backend_factory=lambda *a: relabel, diarizer_factory=one_voice)
     assert relabel.calls == ["beats"]
+
+
+def test_subtitle_file_skips_audio_whisper_and_diarizer(tmp_path):
+    srt = tmp_path / "film.srt"
+    cues = ["ELENA: Hello? Is anyone up here?", "[thunder rumbling]", "TOMAS: The radio is right.",
+            "- Then the lamp has to work.\n- Follow me.", "<i>The ship is turning!</i>", "They see us."]
+    srt.write_text("\n\n".join(f"{i + 1}\n00:00:{i * 9:02d},000 --> 00:00:{i * 9 + 8:02d},000\n{c}"
+                               for i, c in enumerate(cues)), encoding="utf-8")
+    settings = _settings(tmp_path, llm_path=_model(tmp_path))
+    settings.apply_preset("movie")  # diarize is on in this preset; it must be skipped, not fail
+    settings.story_minutes = 5
+    backend, events = FakeBackend(), []
+    result = run_job(srt, settings, events.append,
+                     transcriber_factory=lambda *a: pytest.fail("no Whisper for subtitles"),
+                     diarizer_factory=lambda *a: pytest.fail("no speaker detection for subtitles"),
+                     backend_factory=lambda *a: backend)
+    job = tmp_path / "out" / "jobs"
+    assert not list(job.glob("*/audio.pcm"))
+    transcript = open(result["files"]["transcript.txt"], encoding="utf-8").read()
+    assert "Tomas: The radio is right." in transcript and "[thunder rumbling]" in transcript
+    assert "story.md" in result["files"] and "part" in backend.calls and "map" not in backend.calls
+    assert "Retold from film.srt" in open(result["files"]["story.md"], encoding="utf-8").read()
+    assert [e for e in events if e["type"] == "progress"][-1]["fraction"] == pytest.approx(1.0)
+
+    settings.outputs = ["summary"]  # summaries work from subtitles too
+    result = run_job(srt, settings, lambda e: None, backend_factory=lambda *a: FakeBackend())
+    assert "From subtitles" in open(result["files"]["summary.md"], encoding="utf-8").read()
 
 
 def test_adding_story_to_finished_lecture_only_computes_the_story(wav_file, tmp_path):
