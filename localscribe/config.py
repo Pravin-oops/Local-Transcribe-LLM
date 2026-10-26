@@ -1,8 +1,41 @@
 """User settings, persisted as JSON in %APPDATA%/LocalScribe/settings.json."""
 import json
 import os
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+
+# LLM outputs a job can produce on top of the transcript. Only the selected
+# ones are computed, so a movie retelling never pays for study notes.
+OUTPUTS = {
+    "summary": "Summary",          # overview, key points, timestamped chapters
+    "notes": "Study notes",        # key concepts, takeaways, examples, review questions
+    "story": "Engaging Story",     # narrator script retelling the whole recording
+}
+
+# Content-type presets: (label, outputs, detect speakers)
+PRESETS = {
+    "lecture": ("Lecture / class", ["summary", "notes"], False),
+    "podcast": ("Podcast / talk / interview", ["summary"], True),
+    "movie": ("Movie / story", ["story"], True),
+}
+
+STORY_TONES = {
+    "auto": "Match the film's genre",
+    "suspense": "Suspense / thriller",
+    "epic": "Epic adventure",
+    "drama": "Emotional drama",
+    "comedy": "Light-hearted",
+    "dark": "Dark / eerie",
+    "bedtime": "Gentle bedtime story",
+    "documentary": "Documentary recap",
+}
+
+# Target length in words (spoken at ~165 words per minute).
+STORY_LENGTHS = {
+    "short": ("Short (~6 min read)", 1000),
+    "medium": ("Medium (~15 min read)", 2500),
+    "long": ("Long (~30 min read)", 5000),
+}
 
 
 def app_data_dir() -> Path:
@@ -12,6 +45,10 @@ def app_data_dir() -> Path:
 
 def default_output_dir() -> Path:
     return Path.home() / "Documents" / "LocalScribe"
+
+
+def models_dir() -> Path:
+    return default_output_dir() / "models"
 
 
 @dataclass
@@ -25,8 +62,15 @@ class Settings:
     batch_size: int = 0           # >1 uses faster-whisper's batched pipeline (faster, more VRAM)
     chunk_minutes: float = 10.0
 
-    # Summarization
-    summarize: bool = True
+    # What to produce
+    content_type: str = "lecture"                                     # a PRESETS key or "custom"
+    outputs: list = field(default_factory=lambda: ["summary", "notes"])
+    diarize: bool = False                                             # label speakers
+    num_speakers: int = 0                                             # 0 = detect automatically
+    story_tone: str = "auto"
+    story_length: str = "medium"
+
+    # Local LLM
     llm_path: str = ""            # GGUF instruct model
     llm_ctx: int = 8192
     llm_gpu_layers: int = -1      # -1 = auto-fit to free VRAM, 0 = CPU only
@@ -35,11 +79,22 @@ class Settings:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Settings":
+        data = dict(data)
+        if "outputs" not in data and data.get("summarize") is False:  # v1 settings file
+            data["outputs"] = []
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        settings = cls(**{k: v for k, v in data.items() if k in known})
+        settings.outputs = [o for o in settings.outputs if o in OUTPUTS]
+        return settings
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    def apply_preset(self, name: str) -> None:
+        _, outputs, diarize = PRESETS[name]
+        self.content_type = name
+        self.outputs = list(outputs)
+        self.diarize = diarize
 
 
 def settings_path() -> Path:

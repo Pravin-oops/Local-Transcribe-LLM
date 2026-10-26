@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit,
                                QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
@@ -56,8 +56,11 @@ class SettingsDialog(QDialog):
         self.chunk_minutes.setSuffix(" min")
         self.chunk_minutes.setValue(settings.chunk_minutes)
 
-        self.summarize = QCheckBox("Create chapters and study notes")
-        self.summarize.setChecked(settings.summarize)
+        self.num_speakers = QSpinBox()
+        self.num_speakers.setRange(0, 20)
+        self.num_speakers.setSpecialValueText("Detect automatically")
+        self.num_speakers.setValue(settings.num_speakers)
+        self.num_speakers.setToolTip("Leave on automatic. Set a number only if people are merged or split.")
 
         self.llm_path = QLineEdit(settings.llm_path)
         self.llm_path.setPlaceholderText("Choose a GGUF instruct model, e.g. an 8B Q4_K_M")
@@ -81,8 +84,9 @@ class SettingsDialog(QDialog):
         form.addRow("Beam size", self.beam_size)
         form.addRow("Batch size", self.batch_size)
         form.addRow("Chunk length", self.chunk_minutes)
-        form.addRow(QLabel("<b>Summary</b>"))
-        form.addRow("", self.summarize)
+        form.addRow(QLabel("<b>Speakers</b> (when Detect speakers is ticked)"))
+        form.addRow("Number of speakers", self.num_speakers)
+        form.addRow(QLabel("<b>LLM</b> (summary, study notes, Engaging Story)"))
         form.addRow("Model file", _path_row(self.llm_path, self._browse_llm))
         form.addRow("Context size", self.llm_ctx)
         form.addRow("GPU layers", self.llm_gpu_layers)
@@ -99,7 +103,7 @@ class SettingsDialog(QDialog):
 
     def _browse_llm(self):
         start = str(Path(self.llm_path.text()).parent) if self.llm_path.text() else self.output_dir.text()
-        path, _ = QFileDialog.getOpenFileName(self, "Choose summary model", start, "GGUF models (*.gguf)")
+        path, _ = QFileDialog.getOpenFileName(self, "Choose LLM model", start, "GGUF models (*.gguf)")
         if path:
             self.llm_path.setText(path)
 
@@ -117,7 +121,7 @@ class SettingsDialog(QDialog):
             beam_size=self.beam_size.value(),
             batch_size=self.batch_size.value(),
             chunk_minutes=self.chunk_minutes.value(),
-            summarize=self.summarize.isChecked(),
+            num_speakers=self.num_speakers.value(),
             llm_path=self.llm_path.text().strip(),
             llm_ctx=int(self.llm_ctx.currentText()),
             llm_gpu_layers=self.llm_gpu_layers.value(),

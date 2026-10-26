@@ -1,12 +1,14 @@
-"""Map-reduce summarization of long transcripts with a local GGUF model.
+"""Local GGUF backend plus map-reduce for the Summary and Study notes outputs.
 
 Map:    the transcript is cut into blocks that fit the context window; each
-        block yields chapters (with timestamps) and study notes, saved to
-        ``notes/NNNN.json`` so an interrupted run resumes.
-Reduce: block notes are condensed in groups until they fit, then merged into
-        the final study notes. Chapters are concatenated in time order.
+        block yields only the fields the selected outputs need (chapters, key
+        points, concepts, examples), saved to ``notes/NNNN.json`` so an
+        interrupted run resumes.
+Reduce: block notes are condensed in groups until they fit, then turned into
+        the summary and/or study notes. Chapters are concatenated in time order.
 """
 import gc
+import hashlib
 import json
 import os
 import re
@@ -16,13 +18,13 @@ from pathlib import Path
 
 from localscribe import prompts
 from localscribe.jobs import read_json, write_json_atomic
-from localscribe.merger import group_segments
+from localscribe.merger import group_segments, labelled
 from localscribe.timefmt import hms, parse_hms
 from localscribe.transcriber import Cancelled
 
 MAP_OUTPUT_TOKENS = 1600  # a full ~12 min block asks for ~18 points + chapters + concepts
 CONDENSE_OUTPUT_TOKENS = 1500
-NOTES_OUTPUT_TOKENS = 2000
+REDUCE_OUTPUT_TOKENS = 2000
 PROMPT_OVERHEAD_TOKENS = 600
 
 
@@ -119,10 +121,20 @@ class LlamaBackend:
 
     def complete_json(self, system: str, user: str, schema: dict, max_tokens: int,
                       cancel=None, on_token=None) -> str:
+        """Schema-constrained JSON (llama.cpp grammar), low temperature."""
+        return self._stream(system, user, max_tokens, 0.2, cancel, on_token,
+                            response_format={"type": "json_object", "schema": schema})
+
+    def complete_text(self, system: str, user: str, max_tokens: int, cancel=None, on_token=None,
+                      temperature: float = 0.8) -> str:
+        """Free-form prose (used for the story script)."""
+        return self._stream(system, user, max_tokens, temperature, cancel, on_token,
+                            repeat_penalty=1.1)
+
+    def _stream(self, system, user, max_tokens, temperature, cancel, on_token, **options) -> str:
         stream = self.llm.create_chat_completion(
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            response_format={"type": "json_object", "schema": schema},
-            temperature=0.2, top_p=0.9, max_tokens=max_tokens, stream=True,
+            temperature=temperature, top_p=0.9, max_tokens=max_tokens, stream=True, **options,
         )
         parts, n = [], 0
         for chunk in stream:
@@ -159,7 +171,25 @@ def split_blocks(lines: list, count_tokens, max_tokens: int) -> list:
 
 
 def format_line(line: dict) -> str:
-    return f"[{hms(line['start'])}] {line['text']}"
+    return f"[{hms(line['start'])}] {labelled(line)}"
+
+
+def transcript_blocks(segments: list, backend, output_tokens: int) -> list:
+    """~30 s timestamped lines packed into blocks that fit the context window."""
+    lines = group_segments(segments, max_span=30.0, max_gap=3.0)
+    budget = min(3000, backend.n_ctx - output_tokens - PROMPT_OVERHEAD_TOKENS)
+    return split_blocks(lines, backend.count_tokens, budget)
+
+
+def digest(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
+
+
+def block_key(backend, block: list, **extra) -> dict:
+    """Cache key for a block's LLM result: changes when model, prompts or text
+    (including speaker labels) change."""
+    return {"model": backend.name, "prompts": prompts.VERSION, "start": block[0]["start"],
+            "end": block[-1]["end"], "text": digest("\n".join(format_line(l) for l in block)), **extra}
 
 
 def _words(text: str) -> set:
@@ -262,11 +292,12 @@ def _parse_json(text: str):
         return None
 
 
-def _complete(backend, user: str, schema: dict, max_tokens: int, cancel, on_token, warn):
+def complete_structured(backend, user: str, schema: dict, max_tokens: int, cancel, on_token, warn,
+                        system: str = prompts.SYSTEM):
     """Ask for JSON; on truncated/invalid output retry once with more room."""
     for attempt, budget in enumerate((max_tokens, int(max_tokens * 1.6))):
         prompt = user if attempt == 0 else user + "\nKeep every item brief."
-        data = _parse_json(backend.complete_json(prompts.SYSTEM, prompt, schema, budget,
+        data = _parse_json(backend.complete_json(system, prompt, schema, budget,
                                                  cancel=cancel, on_token=on_token))
         if data is not None:
             return data
@@ -276,57 +307,73 @@ def _complete(backend, user: str, schema: dict, max_tokens: int, cancel, on_toke
 
 # --------------------------------------------------------------------------- map-reduce
 
-def summarize(segments: list, backend, job, title: str, on_progress, cancel=None, warn=print) -> dict:
-    """Run map-reduce over ``segments``; returns {"chapters": [...], "notes": {...}}.
+def summarize(segments: list, backend, job, title: str, outputs, on_progress, cancel=None,
+              warn=print) -> dict:
+    """Map-reduce for the "summary" and/or "notes" outputs.
 
-    ``on_progress(fraction, message)`` reports progress within summarization.
+    The map step asks only for the fields the selected outputs need (chapters
+    and key points for a summary; key points, concepts and examples for study
+    notes). Returns {"summary", "chapters", "notes"} with None for outputs
+    not requested. ``on_progress(fraction, message)`` reports progress.
     """
-    lines = group_segments(segments, max_span=30.0, max_gap=3.0)
-    if not lines:
-        return {"chapters": [], "notes": None}
-
-    block_budget = min(3000, backend.n_ctx - MAP_OUTPUT_TOKENS - PROMPT_OVERHEAD_TOKENS)
-    blocks = split_blocks(lines, backend.count_tokens, block_budget)
-    total = len(blocks)
+    outputs = [o for o in ("summary", "notes") if o in outputs]
+    result = {"summary": None, "chapters": [], "notes": None}
+    fields = prompts.fields_for(outputs)
+    if not fields:
+        return result
+    blocks = transcript_blocks(segments, backend, MAP_OUTPUT_TOKENS)
+    if not blocks:
+        return result
+    total, steps = len(blocks), len(blocks) + len(outputs)
 
     chapters, note_sets = [], []
     for i, block in enumerate(blocks):
-        key = {"model": backend.name, "prompts": prompts.VERSION, "start": block[0]["start"],
-               "end": block[-1]["end"], "lines": len(block)}
+        key = block_key(backend, block)
         cached = read_json(job.note_path(i))
-        if cached and cached.get("key") == key and "raw" in cached:
+        # A cached result is reusable if it has every field we need now (e.g. a
+        # summary+notes run serves a later summary-only run).
+        if cached and cached.get("key") == key and set(fields) <= set(cached.get("fields", [])):
             data = cached["raw"]
         else:
-            message = f"Summarizing part {i + 1}/{total}"
-            on_progress(i / (total + 1), message)
+            message = f"Reading part {i + 1}/{total}"
+            on_progress(i / steps, message)
             minutes = (block[-1]["end"] - block[0]["start"]) / 60
             user = prompts.map_prompt("\n".join(format_line(l) for l in block),
                                       hms(block[0]["start"]), hms(block[-1]["end"]), i + 1, total,
-                                      minutes)
-            data = _complete(backend, user, prompts.MAP_SCHEMA, MAP_OUTPUT_TOKENS, cancel,
-                             lambda n: on_progress(i / (total + 1), f"{message} ({n} tokens)"),
-                             warn) or {}
+                                      minutes, fields)
+            data = complete_structured(backend, user, prompts.map_schema(fields), MAP_OUTPUT_TOKENS,
+                                       cancel, lambda n: on_progress(i / steps, f"{message} ({n} tokens)"),
+                                       warn) or {}
             # Raw model output is cached; cleaning runs on every assembly so fixes
             # to timestamp handling also apply to resumed jobs.
-            write_json_atomic(job.note_path(i), {"key": key, "raw": data})
-        result = {
-            "chapters": clean_chapters(data.get("chapters"), block, segments),
-            "key_points": data.get("key_points", []),
-            "concepts": data.get("concepts", []),
-            "examples": data.get("examples", []),
-        }
-        chapters.extend(result["chapters"])
-        note_sets.append({**result, "label": f"Part {i + 1} [{hms(block[0]['start'])}-{hms(block[-1]['end'])}]"})
+            write_json_atomic(job.note_path(i), {"key": key, "fields": fields, "raw": data})
+        if "summary" in outputs:
+            chapters.extend(clean_chapters(data.get("chapters"), block, segments))
+        note_sets.append({**{f: data.get(f, []) for f in fields if f != "chapters"},
+                          "label": f"Part {i + 1} [{hms(block[0]['start'])}-{hms(block[-1]['end'])}]"})
 
-    on_progress(total / (total + 1), "Writing study notes")
-    notes = _reduce(note_sets, backend, title, cancel, warn,
-                    lambda n: on_progress(total / (total + 1), f"Writing study notes ({n} tokens)"))
-    on_progress(1.0, "Summary complete")
-    return {"chapters": merge_chapters(chapters), "notes": notes}
+    note_sets = _fit_notes(note_sets, fields, backend, cancel, warn,
+                           lambda n: on_progress(total / steps, f"Condensing notes ({n} tokens)"))
+    digest = notes_digest(note_sets)
+    done = total
+    for output, label, prompt_fn, schema in (
+            ("summary", "Writing summary", prompts.summary_prompt, prompts.SUMMARY_SCHEMA),
+            ("notes", "Writing study notes", prompts.notes_prompt, prompts.NOTES_SCHEMA)):
+        if output not in outputs:
+            continue
+        on_progress(done / steps, label)
+        result[output] = complete_structured(
+            backend, prompt_fn(digest, title), schema, REDUCE_OUTPUT_TOKENS, cancel,
+            lambda n, label=label, done=done: on_progress(done / steps, f"{label} ({n} tokens)"), warn)
+        done += 1
+    result["chapters"] = merge_chapters(chapters)
+    on_progress(1.0, "Notes complete")
+    return result
 
 
-def _reduce(note_sets: list, backend, title: str, cancel, warn, on_token):
-    budget = backend.n_ctx - NOTES_OUTPUT_TOKENS - PROMPT_OVERHEAD_TOKENS
+def _fit_notes(note_sets: list, fields, backend, cancel, warn, on_token) -> list:
+    """Condense block notes in groups until they fit the reduce prompt."""
+    budget = backend.n_ctx - REDUCE_OUTPUT_TOKENS - PROMPT_OVERHEAD_TOKENS
     rounds = 0
     while backend.count_tokens(notes_digest(note_sets)) > budget and rounds < 4:
         rounds += 1
@@ -341,30 +388,39 @@ def _reduce(note_sets: list, backend, title: str, cancel, warn, on_token):
         groups.append(current)
         condensed = []
         for g in groups:
-            data = _complete(backend, prompts.condense_prompt(notes_digest(g)),
-                             prompts.CONDENSE_SCHEMA, CONDENSE_OUTPUT_TOKENS, cancel, on_token, warn)
+            data = complete_structured(backend, prompts.condense_prompt(notes_digest(g), fields),
+                                       prompts.condense_schema(fields), CONDENSE_OUTPUT_TOKENS,
+                                       cancel, on_token, warn)
             if data:
                 label = g[0]["label"] if len(g) == 1 else f"{g[0]['label']} to {g[-1]['label']}"
                 condensed.append({**data, "label": label})
         note_sets = condensed or note_sets
-    return _complete(backend, prompts.notes_prompt(notes_digest(note_sets), title),
-                     prompts.NOTES_SCHEMA, NOTES_OUTPUT_TOKENS, cancel, on_token, warn)
+    return note_sets
 
 
 # --------------------------------------------------------------------------- rendering
 
-def render_chapters(chapters: list) -> str:
-    out = ["## Chapters", ""]
-    for ch in chapters:
-        summary = f" — {ch['summary']}" if ch.get("summary") else ""
-        out.append(f"- **[{hms(ch['start'])}] {ch['title']}**{summary}")
-    return "\n".join(out) + "\n"
+def render_summary(summary: dict, chapters: list) -> str:
+    out = ["## Summary", ""]
+    if summary:
+        out += [summary.get("overview", "").strip(), ""]
+        if summary.get("key_points"):
+            out += ["### Key Points", ""] + [f"- {p}" for p in summary["key_points"]] + [""]
+    else:
+        out += ["*The summary could not be generated.*", ""]
+    if chapters:
+        out += ["### Chapters", ""]
+        for ch in chapters:
+            line = f" — {ch['summary']}" if ch.get("summary") else ""
+            out.append(f"- **[{hms(ch['start'])}] {ch['title']}**{line}")
+        out.append("")
+    return "\n".join(out)
 
 
 def render_notes(notes: dict) -> str:
     if not notes:
-        return "## Study Notes\n\n_Study notes could not be generated._\n"
-    out = ["## Study Notes", "", "### Overview", "", notes.get("overview", "").strip(), ""]
+        return "## Study Notes\n\n*Study notes could not be generated.*\n"
+    out = ["## Study Notes", ""]
     if notes.get("key_concepts"):
         out += ["### Key Concepts", ""]
         out += [f"- **{c.get('term', '').strip()}**: {c.get('explanation', '').strip()}"

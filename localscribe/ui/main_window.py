@@ -9,9 +9,10 @@ from PySide6.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWi
                                QVBoxLayout, QWidget)
 
 from localscribe import audio
-from localscribe.config import load_settings, save_settings
+from localscribe.config import OUTPUTS, load_settings, save_settings
 from localscribe.jobs import Job, read_json
 from localscribe.timefmt import hms
+from localscribe.ui.output_picker import OutputPicker
 from localscribe.ui.settings_dialog import SettingsDialog
 from localscribe.ui.worker import JobRunner
 
@@ -53,6 +54,8 @@ class MainWindow(QMainWindow):
         self.runner.finished.connect(self._on_finished)
 
         self.drop = DropArea()
+        self.picker = OutputPicker(self.settings)
+        self.picker.changed.connect(self._outputs_changed)
 
         self.open_btn = QPushButton("Open file…")
         self.start_btn = QPushButton("Start")
@@ -84,19 +87,20 @@ class MainWindow(QMainWindow):
         mono.setStyleHint(QFont.Monospace)
         self.transcript = QPlainTextEdit(readOnly=True)
         self.transcript.setFont(mono)
-        self.chapters = QTextBrowser(openExternalLinks=True)
-        self.notes = QTextBrowser(openExternalLinks=True)
+        # One rendered-Markdown view per LLM output, shown when selected or present.
+        self.views = {key: QTextBrowser(openExternalLinks=True) for key in OUTPUTS}
         self.log = QPlainTextEdit(readOnly=True)
         self.log.setFont(mono)
         self.tabs = QTabWidget()
         self.tabs.addTab(self.transcript, "Transcript")
-        self.tabs.addTab(self.chapters, "Chapters")
-        self.tabs.addTab(self.notes, "Study Notes")
+        for key, label in OUTPUTS.items():
+            self.tabs.addTab(self.views[key], label)
         self.tabs.addTab(self.log, "Log")
 
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addWidget(self.drop)
+        layout.addWidget(self.picker)
         layout.addLayout(buttons)
         layout.addWidget(self.progress)
         layout.addWidget(self.status)
@@ -104,6 +108,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self._refresh_model_label()
+        self._refresh_tabs()
         self._set_busy(False)
 
     # ------------------------------------------------------------------ file selection
@@ -146,15 +151,18 @@ class MainWindow(QMainWindow):
         self._set_busy(False)
 
     def _resume_hint(self, path: Path) -> str:
-        manifest = read_json(Job.root_for(path, Path(self.settings.output_dir)) / "manifest.json")
+        root = Job.root_for(path, Path(self.settings.output_dir))
+        manifest = read_json(root / "manifest.json")
         if not manifest or not manifest.get("chunks"):
             return ""
-        stages = manifest.get("stages", {})
-        if stages.get("summarized") or (stages.get("transcribed") and not self.settings.summarize):
-            return "Already processed: results loaded below"
-        root = Job.root_for(path, Path(self.settings.output_dir))
-        done = sum(1 for i in range(len(manifest["chunks"])) if (root / "parts" / f"{i:04d}.json").exists())
-        return f"Earlier progress found: {done}/{len(manifest['chunks'])} parts done, Start will resume"
+        if manifest.get("stages", {}).get("transcribed"):
+            done = manifest.get("outputs_done", {})
+            missing = [OUTPUTS[o] for o in self.settings.outputs if o not in done]
+            if not missing:
+                return "Already processed: results loaded below"
+            return f"Transcript ready: Start will add {', '.join(missing)}"
+        parts = sum(1 for i in range(len(manifest["chunks"])) if (root / "parts" / f"{i:04d}.json").exists())
+        return f"Earlier progress found: {parts}/{len(manifest['chunks'])} parts done, Start will resume"
 
     def _load_existing_outputs(self, path: Path):
         root = Job.root_for(path, Path(self.settings.output_dir))
@@ -168,18 +176,18 @@ class MainWindow(QMainWindow):
             self._choose_file()
             if not self.source:
                 return
-        if self.settings.summarize and not self.settings.llm_path:
+        if self.settings.outputs and not self.settings.llm_path:
             choice = QMessageBox.question(
-                self, "No summary model",
-                "No summary model is selected, so only the transcript will be created.\n\n"
+                self, "No LLM model",
+                "No LLM model is selected, so only the transcript will be created.\n\n"
                 "Choose a GGUF model in Settings first?",
                 QMessageBox.Yes | QMessageBox.No)
             if choice == QMessageBox.Yes:
                 self._open_settings()
                 return
         self.transcript.clear()
-        self.chapters.clear()
-        self.notes.clear()
+        for view in self.views.values():
+            view.clear()
         self.log.clear()
         self.progress.setValue(0)
         self.status.setText("Starting…")
@@ -196,6 +204,7 @@ class MainWindow(QMainWindow):
         self.start_btn.setEnabled(not busy and self.source is not None)
         self.open_btn.setEnabled(not busy)
         self.settings_btn.setEnabled(not busy)
+        self.picker.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
         self.folder_btn.setEnabled(self.job_dir is not None)
 
@@ -221,8 +230,10 @@ class MainWindow(QMainWindow):
             took = hms(time.monotonic() - self.started_at) if self.started_at else ""
             self.status.setText(f"Done in {took}. Files are in the output folder.")
             self._show_outputs(Path(ev["job_dir"]))
-            if (Path(ev["job_dir"]) / "chapters.md").exists():
-                self.tabs.setCurrentWidget(self.chapters)
+            for key in ("story", "summary", "notes"):  # most specific output first
+                if key in self.settings.outputs and (Path(ev["job_dir"]) / f"{key}.md").exists():
+                    self.tabs.setCurrentWidget(self.views[key])
+                    break
         elif kind == "cancelled":
             self.status.setText("Stopped. Finished parts are saved; press Start to resume.")
         elif kind == "error":
@@ -242,14 +253,28 @@ class MainWindow(QMainWindow):
             self.transcript.setPlainText(transcript.read_text(encoding="utf-8"))
         else:
             self.transcript.clear()
-        for name, view in (("chapters.md", self.chapters), ("notes.md", self.notes)):
-            path = root / name
+        for key, view in self.views.items():
+            path = root / f"{key}.md"
             if path.exists():
                 view.setMarkdown(path.read_text(encoding="utf-8"))
             else:
                 view.clear()
+        self._refresh_tabs()
+
+    def _refresh_tabs(self):
+        """Show an output's tab when it is selected or already exists for this file."""
+        for key, view in self.views.items():
+            exists = self.job_dir is not None and (Path(self.job_dir) / f"{key}.md").exists()
+            self.tabs.setTabVisible(self.tabs.indexOf(view), key in self.settings.outputs or exists)
 
     # ------------------------------------------------------------------ settings & misc
+
+    def _outputs_changed(self):
+        self.picker.apply_to(self.settings)
+        save_settings(self.settings)
+        self._refresh_tabs()
+        if self.source:
+            self._set_source(self.source)
 
     def _open_settings(self):
         dialog = SettingsDialog(self.settings, self)
@@ -262,8 +287,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_model_label(self):
         llm = Path(self.settings.llm_path).stem if self.settings.llm_path else "none"
-        summary = llm if self.settings.summarize else "off"
-        self.model_label.setText(f"Whisper: {self.settings.whisper_model}  ·  Summary: {summary}")
+        self.model_label.setText(f"Whisper: {self.settings.whisper_model}  ·  LLM: {llm}")
 
     def _open_folder(self):
         if self.job_dir and Path(self.job_dir).exists():

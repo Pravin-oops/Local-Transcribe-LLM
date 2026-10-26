@@ -13,14 +13,18 @@ def _norm(text: str) -> str:
     return re.sub(r"[^\w ]+", "", text.lower()).strip()
 
 
-def keep_segment(start: float, end: float, text: str, chunk_length: float, prev_text: str) -> bool:
-    """Filter the two hallucination patterns Whisper shows on trailing silence.
+_SOUND_TAG = re.compile(r"^\s*[\[(][^\])]*[\])]\s*$")  # "[Music]", "(applause)"
 
+
+def keep_segment(start: float, end: float, text: str, chunk_length: float, prev_text: str) -> bool:
+    """Filter non-speech and the two hallucination patterns Whisper shows on silence.
+
+    - Pure sound tags such as "[Music]" or "♪ ♪" (common on film soundtracks).
     - A segment near the chunk end whose timestamps run past the audio it was
       given (e.g. "Thank you." stamped 90.2-100.5 s in a 90.4 s chunk).
     - An exact repeat of the previous segment's text.
     """
-    if not _norm(text):
+    if not _norm(text) or _SOUND_TAG.match(text):
         return False
     if start >= chunk_length - 1.5 and end > chunk_length + 0.5:
         return False

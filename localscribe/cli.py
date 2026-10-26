@@ -4,7 +4,7 @@ import sys
 import threading
 
 from localscribe import __version__
-from localscribe.config import load_settings
+from localscribe.config import OUTPUTS, PRESETS, STORY_LENGTHS, STORY_TONES, load_settings
 from localscribe.timefmt import hms
 from localscribe.transcriber import Cancelled
 
@@ -20,6 +20,8 @@ def _cmd_info(_args) -> int:
     print(f"CPU/RAM:  {hw.physical_cores} cores, {hw.ram_gb:.1f} GB RAM")
     print(f"Whisper:  {settings.whisper_model} on {device} ({compute})")
     print(f"LLM:      {settings.llm_path or '(not set)'}")
+    print(f"Outputs:  {', '.join(OUTPUTS[o] for o in settings.outputs) or 'transcript only'}"
+          f"{' + speaker labels' if settings.diarize else ''}")
     print(f"Output:   {settings.output_dir}")
     return 0
 
@@ -28,13 +30,19 @@ def _cmd_run(args) -> int:
     from localscribe.pipeline import run_job
 
     settings = load_settings()
+    if args.preset:
+        settings.apply_preset(args.preset)
     for attr, value in (("whisper_model", args.whisper_model), ("llm_path", args.llm),
                         ("chunk_minutes", args.chunk_minutes), ("output_dir", args.output),
-                        ("device", args.device), ("batch_size", args.batch_size)):
+                        ("device", args.device), ("batch_size", args.batch_size),
+                        ("story_tone", args.tone), ("story_length", args.length),
+                        ("num_speakers", args.speakers), ("diarize", args.diarize)):
         if value is not None:
             setattr(settings, attr, value)
-    if args.no_summary:
-        settings.summarize = False
+    if args.outputs is not None:
+        settings.outputs = [o.strip() for o in args.outputs.split(",") if o.strip() in OUTPUTS]
+    if args.transcript_only:
+        settings.outputs = []
 
     def emit(event):
         kind = event["type"]
@@ -74,12 +82,21 @@ def main(argv=None) -> int:
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("gui", help="open the desktop app (default)")
     sub.add_parser("info", help="show detected hardware and settings")
-    run = sub.add_parser("run", help="transcribe (and summarize) one file")
+    run = sub.add_parser("run", help="transcribe one file and produce the selected outputs")
     run.add_argument("file")
+    run.add_argument("--preset", choices=list(PRESETS),
+                     help="lecture = summary + notes, podcast = summary, movie = Engaging Story")
+    run.add_argument("--outputs", help=f"comma-separated, any of: {','.join(OUTPUTS)}")
+    run.add_argument("--transcript-only", "--no-summary", action="store_true",
+                     help="skip all LLM outputs")
+    run.add_argument("--tone", choices=list(STORY_TONES), help="Engaging Story narration tone")
+    run.add_argument("--length", choices=list(STORY_LENGTHS), help="Engaging Story length")
+    run.add_argument("--diarize", action=argparse.BooleanOptionalAction, default=None,
+                     help="label speakers (on by default for podcast and movie presets)")
+    run.add_argument("--speakers", type=int, help="number of speakers, 0 = detect")
     run.add_argument("--whisper-model")
-    run.add_argument("--llm", help="path to a GGUF summary model")
-    run.add_argument("--no-summary", action="store_true")
-    run.add_argument("--resummarize", action="store_true", help="redo the summary from scratch")
+    run.add_argument("--llm", help="path to a GGUF instruct model")
+    run.add_argument("--resummarize", action="store_true", help="redo all LLM outputs from scratch")
     run.add_argument("--chunk-minutes", type=float)
     run.add_argument("--batch-size", type=int)
     run.add_argument("--device", choices=["auto", "cuda", "cpu"])

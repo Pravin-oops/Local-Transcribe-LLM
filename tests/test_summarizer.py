@@ -1,5 +1,5 @@
 from localscribe.jobs import Job
-from localscribe.summarizer import (clean_chapters, merge_chapters, render_chapters, render_notes,
+from localscribe.summarizer import (clean_chapters, merge_chapters, render_notes, render_summary,
                                     split_blocks, summarize)
 
 from fakes import FakeBackend, fake_segments
@@ -67,29 +67,56 @@ def test_summarize_caches_map_results(tmp_path):
     job = Job(tmp_path)
     backend = FakeBackend(n_ctx=3600)  # 1800-token blocks -> several blocks
     events = []
-    result = summarize(fake_segments(400), backend, job, "Lecture", lambda f, m: events.append(f))
+    result = summarize(fake_segments(400), backend, job, "Lecture", ["summary", "notes"],
+                       lambda f, m: events.append(f))
     assert backend.calls.count("map") >= 3
     assert "condense" not in backend.calls
-    assert result["notes"]["overview"] == "Overview."
+    assert backend.calls[-2:] == ["summary", "notes"]
+    assert result["summary"]["overview"] == "Overview."
+    assert result["notes"]["review_questions"] == ["Why?"]
     assert result["chapters"] == sorted(result["chapters"], key=lambda c: c["start"])
     assert events[-1] == 1.0
 
     again = FakeBackend(n_ctx=3600)
-    summarize(fake_segments(400), again, job, "Lecture", lambda f, m: None)
+    summarize(fake_segments(400), again, job, "Lecture", ["summary", "notes"], lambda f, m: None)
     assert "map" not in again.calls  # resumed from notes/*.json
+
+
+def test_map_asks_only_for_fields_the_outputs_need(tmp_path):
+    job = Job(tmp_path)
+    summary_only = FakeBackend()
+    result = summarize(fake_segments(60), summary_only, job, "Talk", ["summary"], lambda f, m: None)
+    assert summary_only.schemas[0] == ["chapters", "key_points"]   # no concepts/examples
+    assert "notes" not in summary_only.calls and result["notes"] is None
+    assert result["chapters"]
+
+    # Notes later need concepts/examples the cache lacks -> map runs again.
+    add_notes = FakeBackend()
+    summarize(fake_segments(60), add_notes, job, "Talk", ["notes"], lambda f, m: None)
+    assert add_notes.schemas[0] == ["concepts", "examples", "key_points"]
+
+    # A summary after a notes-only run still lacks chapters -> map again; after a
+    # combined run, a summary-only request is served from the cache.
+    both = FakeBackend()
+    summarize(fake_segments(60), both, job, "Talk", ["summary", "notes"], lambda f, m: None)
+    cached = FakeBackend()
+    summarize(fake_segments(60), cached, job, "Talk", ["summary"], lambda f, m: None)
+    assert "map" not in cached.calls and cached.calls == ["summary"]
 
 
 def test_reduce_condenses_when_notes_do_not_fit(tmp_path):
     backend = FakeBackend(n_ctx=2620)  # leaves ~20 tokens for the notes digest
-    summarize(fake_segments(200), backend, Job(tmp_path), "Lecture", lambda f, m: None)
+    summarize(fake_segments(200), backend, Job(tmp_path), "Lecture", ["notes"], lambda f, m: None)
     assert "condense" in backend.calls
     assert backend.calls[-1] == "notes"
 
 
 def test_render_outputs():
-    md = render_chapters([{"start": 75, "title": "Intro", "summary": "Hi."}])
-    assert "- **[00:01:15] Intro** — Hi." in md
-    notes = render_notes({"overview": "O", "key_concepts": [{"term": "T", "explanation": "E"}],
+    md = render_summary({"overview": "It covers X.", "key_points": ["P1"]},
+                        [{"start": 75, "title": "Intro", "summary": "Hi."}])
+    assert "It covers X." in md and "- P1" in md and "- **[00:01:15] Intro** — Hi." in md
+    assert "could not be generated" in render_summary(None, [])
+    notes = render_notes({"key_concepts": [{"term": "T", "explanation": "E"}],
                           "key_takeaways": ["K"], "examples": [], "review_questions": ["Q?"]})
     assert "- **T**: E" in notes and "1. Q?" in notes and "### Examples" not in notes
     assert "could not be generated" in render_notes(None)
