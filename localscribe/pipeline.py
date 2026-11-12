@@ -6,7 +6,8 @@ Everything reports through ``emit(event: dict)`` so the same code drives the
 CLI and the desktop UI (where events cross a multiprocessing queue). Events:
 
 A YouTube link as the source is first turned into a local file by youtube.fetch
-(the video's captions, or its audio when it has none).
+(the video's captions, or its audio when it has none). With a translation
+language selected, the finished Engaging Story is translated as the last stage.
 
     {"type": "job", "job_dir"}
     {"type": "progress", "stage", "fraction", "message", "eta"}
@@ -22,7 +23,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from localscribe import audio, hardware, prompts, subtitles, youtube
+from localscribe import audio, hardware, prompts, subtitles, translator, youtube
 from localscribe.subtitles import is_subtitle
 from localscribe.config import OUTPUTS, Settings
 from localscribe.jobs import Job, read_json, write_json_atomic
@@ -35,7 +36,7 @@ from localscribe.transcriber import Cancelled, Transcriber
 SR = audio.SAMPLE_RATE
 
 # Relative cost of each stage, used to map stage progress onto one bar.
-STAGE_WEIGHTS = {"prepare": 1, "transcribe": 12, "diarize": 3, "summarize": 6, "story": 8}
+STAGE_WEIGHTS = {"prepare": 1, "transcribe": 12, "diarize": 3, "summarize": 6, "story": 8, "translate": 2}
 
 
 class _NeverCancel:
@@ -96,8 +97,23 @@ def _default_diarizer(samples, settings: Settings, on_progress, cancel, on_statu
                             on_progress, cancel, on_status=on_status)
 
 
+def _default_translator(settings: Settings, on_status):
+    """NLLB on the GPU when there is one (the LLM is unloaded by now), else on the CPU."""
+    folder = translator.ensure_model(on_status)
+    cores = hardware.detect().physical_cores
+    device, compute = hardware.whisper_runtime(settings.device, "auto")
+    try:
+        return translator.NllbTranslator(folder, device, compute, cores)
+    except Exception as exc:
+        if device != "cuda":
+            raise
+        on_status(f"GPU unavailable for translation ({exc}); using the CPU")
+        return translator.NllbTranslator(folder, "cpu", "int8", cores)
+
+
 def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = False,
-            transcriber_factory=None, backend_factory=None, diarizer_factory=None) -> dict:
+            transcriber_factory=None, backend_factory=None, diarizer_factory=None,
+            translator_factory=None) -> dict:
     cancel = cancel or _NeverCancel()
     fetched = url = None
     if youtube.is_url(source):  # captions (or audio) become a local file, then the job runs as usual
@@ -117,6 +133,10 @@ def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = F
     if use_llm:
         stages += (["summarize"] if {"summary", "notes"} & set(outputs) else []) + \
                   (["story"] if "story" in outputs else [])
+    # The last stage: the finished story, translated (only the story is translated).
+    translate = settings.translate_to in translator.LANGUAGES and "story" in outputs
+    if translate:
+        stages.append("translate")
     report = _Reporter(emit, stages)
     job = Job.for_source(source, Path(settings.output_dir))
     report.log_path = job.output("log.txt")
@@ -145,6 +165,9 @@ def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = F
     elif use_llm:
         files.update(_llm_outputs(job, source, segments, settings, outputs, report, cancel, resummarize,
                                   backend_factory or _default_backend))
+    if translate:
+        files.update(_translate_story(job, settings, report, cancel,
+                                      translator_factory or _default_translator))
 
     result = {"type": "done", "job_dir": str(job.root), "files": files}
     report.log("Job finished")
@@ -392,6 +415,61 @@ def _llm_outputs(job: Job, source: Path, segments: list, settings: Settings, out
     finally:
         backend.close()
     return files
+
+
+def _translate_story(job: Job, settings: Settings, report: _Reporter, cancel, factory) -> dict:
+    """story.md -> story.<lang>.md. Reused while the story and the model are unchanged;
+    finished sentences are saved as it goes, so a stopped translation resumes."""
+    code = settings.translate_to
+    language = translator.language_name(code)
+    story_path, out_path = job.output("story.md"), job.output(translator.output_name(code))
+    if not story_path.exists():
+        report.progress("translate", 1.0, f"No story to translate to {language}")
+        return {}
+    story = story_path.read_text(encoding="utf-8")
+    key = {"model": translator.MODEL_NAME, "story": hashlib.sha1(story.encode("utf-8")).hexdigest()[:12]}
+    done = job.load_manifest().get("outputs_done", {})
+    if done.get(f"story.{code}") == key and out_path.exists():
+        report.log(f"{language} story already complete")
+        report.progress("translate", 1.0, f"{language} story already complete")
+        return {out_path.name: str(out_path)}
+
+    t0 = time.monotonic()
+    cache_path = job.output("story") / f"translation_{code}.json"
+    cached = read_json(cache_path) or {}
+    pairs = cached.get("pairs", {}) if cached.get("model") == translator.MODEL_NAME else {}
+    engine = None
+
+    def translate(texts: list) -> list:
+        nonlocal engine
+        missing = list(dict.fromkeys(t for t in texts if t not in pairs))
+        if missing:
+            report.progress("translate", 0.0, f"Loading the translation model {translator.MODEL_NAME}")
+            engine = factory(settings, report.log)
+            report.log(f"Translating {len(missing)} sentences to {language} with {engine.name} "
+                       f"on {getattr(engine, 'device', 'cpu')}")
+        for i in range(0, len(missing), translator.BATCH):
+            batch = missing[i:i + translator.BATCH]
+            report.progress("translate", i / len(missing),
+                            f"Translating the story to {language} ({i}/{len(missing)} sentences)")
+            pairs.update(zip(batch, engine.translate(batch, code, cancel=cancel)))
+            write_json_atomic(cache_path, {"model": translator.MODEL_NAME, "pairs": pairs})
+        return [pairs[t] for t in texts]
+
+    try:
+        text = translator.translate_markdown(
+            story, translate, translator.LANGUAGES[code][2],
+            note=f"{language} translation by {translator.MODEL_NAME}")
+    finally:
+        if engine is not None:
+            engine.close()
+    out_path.write_text(text, encoding="utf-8")
+    done = job.load_manifest().get("outputs_done", {})
+    done[f"story.{code}"] = key
+    job.update_manifest(outputs_done=done)
+    report.log(f"{language} story written in {hms(time.monotonic() - t0)}")
+    report.progress("translate", 1.0, f"{language} story complete")
+    return {out_path.name: str(out_path)}
 
 
 def process_main(source: str, settings_dict: dict, queue, cancel, resummarize: bool = False) -> None:

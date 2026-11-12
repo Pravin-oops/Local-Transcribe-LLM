@@ -8,6 +8,7 @@ from localscribe.config import OUTPUTS, PRESETS, STORY_TONES, load_settings, sto
 from localscribe.subtitles import is_subtitle
 from localscribe.timefmt import hms
 from localscribe.transcriber import Cancelled
+from localscribe.translator import LANGUAGES, language_name
 
 
 def _cmd_info(_args) -> int:
@@ -22,7 +23,8 @@ def _cmd_info(_args) -> int:
     print(f"Whisper:  {settings.whisper_model} on {device} ({compute})")
     print(f"LLM:      {settings.llm_path or '(not set)'}")
     print(f"Outputs:  {', '.join(OUTPUTS[o] for o in settings.outputs) or 'transcript only'}"
-          f"{' + speaker labels' if settings.diarize else ''}")
+          f"{' + speaker labels' if settings.diarize else ''}"
+          f"{f' + story in {language_name(settings.translate_to)}' if language_name(settings.translate_to) else ''}")
     print(f"Output:   {settings.output_dir}")
     return 0
 
@@ -44,7 +46,8 @@ def _cmd_run(args) -> int:
                         ("device", args.device), ("batch_size", args.batch_size),
                         ("story_tone", args.tone),
                         ("story_minutes", story_minutes(args.length) if args.length else args.minutes),
-                        ("num_speakers", args.speakers), ("diarize", args.diarize)):
+                        ("num_speakers", args.speakers), ("diarize", args.diarize),
+                        ("translate_to", {"none": ""}.get(args.translate, args.translate))):
         if value is not None:
             setattr(settings, attr, value)
     if args.outputs is not None:
@@ -105,6 +108,8 @@ def main(argv=None) -> int:
     run.add_argument("--minutes", type=int, help="Engaging Story length as reading time in minutes")
     run.add_argument("--length", choices=["short", "medium", "long"],
                      help="shortcut for --minutes 5 / 15 / 30")
+    run.add_argument("--translate", choices=[*LANGUAGES, "none"],
+                     help="also write the Engaging Story in this language (ta = Tamil); none turns it off")
     run.add_argument("--diarize", action=argparse.BooleanOptionalAction, default=None,
                      help="label speakers (on by default for podcast and movie presets)")
     run.add_argument("--speakers", type=int, help="number of speakers, 0 = detect")

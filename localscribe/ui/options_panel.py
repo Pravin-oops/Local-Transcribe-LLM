@@ -5,7 +5,7 @@ and the total reading time, laid out like the sketch:
     LLM model          ( Meta Llama 3.1 8B · Q4   4.9 GB  v )
     Content            [ Lecture | Podcast | Movie | Custom ]
     Output             (Summary) (Study notes) (Engaging Story)   (Detect speakers)
-    Story              [ Match the film's genre v ]  [ 15 min read v ]
+    Story              [ Match the film's genre v ]  [ 15 min read v ]   (Translate to Tamil)
     Reading time       About 22 min of reading · Engaging Story 15 · Summary 3 · ...
 
 Picking a preset ticks its outputs; ticking chips by hand switches the preset
@@ -14,7 +14,7 @@ to the matching one, or to Custom. Only models found on disk are listed.
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QComboBox, QGridLayout, QHBoxLayout, QLabel, QWidget
 
-from localscribe import models
+from localscribe import models, translator
 from localscribe.config import OUTPUTS, PRESETS, STORY_MINUTES, STORY_TONES, Settings, models_dir
 from localscribe.ui import theme
 from localscribe.ui.widgets import Card, Chip, ModelPicker, SegmentedControl, icon_label
@@ -66,6 +66,11 @@ class OptionsPanel(Card):
         self.minutes = QComboBox()
         for m in STORY_MINUTES:
             self.minutes.addItem(f"{m} min read", m)
+        # One chip per translation language (Tamil today); at most one is on.
+        self.translate = {code: Chip(f"Translate to {name}",
+                                     f"Also write the story in {name} once it is finished. Runs offline with "
+                                     f"{translator.MODEL_NAME} (1.3 GB download on first use).")
+                          for code, (name, _, _) in translator.LANGUAGES.items()}
         self.reading = QLabel()
         self.reading.setObjectName("Reading")
 
@@ -74,7 +79,7 @@ class OptionsPanel(Card):
         grid.setVerticalSpacing(12)
         grid.setColumnStretch(1, 1)
         self.story_label = _field("Story")
-        self.story_row = _row(self.tone, self.minutes)
+        self.story_row = _row(self.tone, self.minutes, None, *self.translate.values())
         rows = [
             ("Transcribe model", _row(self.whisper)),
             ("LLM model", _row(self.llm)),
@@ -97,6 +102,17 @@ class OptionsPanel(Card):
             chip.toggled.connect(self._chips_changed)
         self.tone.currentIndexChanged.connect(self.changed)
         self.minutes.currentIndexChanged.connect(self.changed)
+        for code, chip in self.translate.items():
+            chip.toggled.connect(lambda on, code=code: self._translate_toggled(code, on))
+
+    def _translate_toggled(self, code: str, on: bool) -> None:
+        if on:  # one language at a time
+            for other, chip in self.translate.items():
+                if other != code and chip.isChecked():
+                    chip.blockSignals(True)
+                    chip.setChecked(False)
+                    chip.blockSignals(False)
+        self.changed.emit()
 
     # ------------------------------------------------------------------ models
 
@@ -118,9 +134,11 @@ class OptionsPanel(Card):
     # ------------------------------------------------------------------ settings
 
     def load(self, s: Settings) -> None:
-        widgets = [self.speakers, self.tone, self.minutes, *self.chips.values()]
+        widgets = [self.speakers, self.tone, self.minutes, *self.chips.values(), *self.translate.values()]
         for w in widgets:
             w.blockSignals(True)
+        for code, chip in self.translate.items():
+            chip.setChecked(s.translate_to == code)
         self.preset.set_current(s.content_type if s.content_type in self.preset.buttons else "custom")
         for key, chip in self.chips.items():
             chip.setChecked(key in s.outputs)
@@ -141,6 +159,7 @@ class OptionsPanel(Card):
         s.diarize = self.speakers.isChecked()
         s.story_tone = self.tone.currentData()
         s.story_minutes = self.minutes.currentData()
+        s.translate_to = next((code for code, chip in self.translate.items() if chip.isChecked()), "")
         if self.whisper.current:
             s.whisper_model = self.whisper.current
         s.llm_path = self.llm.current

@@ -74,6 +74,7 @@ class Settings:
     num_speakers: int = 0                                             # 0 = detect automatically
     story_tone: str = "auto"
     story_minutes: int = 15
+    translate_to: str = ""        # "" or a translator.LANGUAGES code ("ta"): also write the story in it
 
     # Local LLM
     llm_path: str = ""            # GGUF instruct model

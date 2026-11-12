@@ -76,6 +76,28 @@ def test_story_minutes_round_trip(app):
     assert _state(panel).story_minutes == 12 and panel.minutes.currentText() == "12 min read"
 
 
+def test_translate_chip_round_trips_and_shows_the_tamil_tab(app, tmp_path, monkeypatch):
+    panel = OptionsPanel(Settings(outputs=["story"], content_type="movie", diarize=True))
+    assert _state(panel).translate_to == "" and not panel.translate["ta"].isChecked()
+    changed = []
+    panel.changed.connect(lambda: changed.append(1))
+    panel.translate["ta"].click()
+    assert _state(panel).translate_to == "ta" and changed
+    assert _state(panel).content_type == "movie"  # translating does not make the preset "custom"
+    assert OptionsPanel(Settings(outputs=["story"], translate_to="ta")).translate["ta"].isChecked()
+
+    from localscribe.ui import main_window
+    monkeypatch.setattr(main_window, "load_settings", lambda: Settings(
+        output_dir=str(tmp_path / "out"), outputs=["story"], content_type="movie", translate_to="ta"))
+    monkeypatch.setattr(main_window, "save_settings", lambda s: None)
+    win = main_window.MainWindow()
+    index = win.tabs.indexOf(win.translated)
+    assert win.tabs.isTabVisible(index) and win.tabs.tabText(index) == "Story in Tamil"
+    win.panel.translate["ta"].click()   # switched off and nothing translated yet: the tab goes
+    assert not win.tabs.isTabVisible(index)
+    win.close()
+
+
 def test_opening_subtitles_selects_movie_preset_and_shows_reading_time(app, tmp_path, monkeypatch):
     from localscribe.ui import main_window
     monkeypatch.setattr(main_window, "load_settings", lambda: Settings(output_dir=str(tmp_path / "out")))

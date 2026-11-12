@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMai
                                QPlainTextEdit, QProgressBar, QPushButton, QTabWidget, QTextBrowser, QVBoxLayout,
                                QWidget)
 
-from localscribe import audio, models, subtitles, youtube
+from localscribe import audio, models, subtitles, translator, youtube
 from localscribe.config import OUTPUTS, load_settings, models_dir, save_settings
 from localscribe.estimates import reading_summary
 from localscribe.jobs import Job, read_json
@@ -120,6 +120,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.transcript, "Transcript")
         for key, label in OUTPUTS.items():
             self.tabs.addTab(self.views[key], label)
+        self.translated = QTextBrowser(openExternalLinks=True)  # the story in the selected language
+        self.tabs.addTab(self.translated, "Translated story")
         self.tabs.addTab(self.log, "Log")
 
         page = QWidget()
@@ -314,6 +316,9 @@ class MainWindow(QMainWindow):
         if manifest.get("stages", {}).get("transcribed"):
             done = manifest.get("outputs_done", {})
             missing = [OUTPUTS[o] for o in self.settings.outputs if o not in done]
+            code = self.settings.translate_to
+            if code in translator.LANGUAGES and "story" in self.settings.outputs and f"story.{code}" not in done:
+                missing.append(f"Story in {translator.language_name(code)}")
             if not missing:
                 return "Already processed: results loaded below"
             return f"Transcript ready: Start will add {', '.join(missing)}"
@@ -344,7 +349,7 @@ class MainWindow(QMainWindow):
                 self._add_llm()
                 return
         self.transcript.clear()
-        for view in self.views.values():
+        for view in [*self.views.values(), self.translated]:
             view.clear()
         self.log.clear()
         self.progress.setValue(0)
@@ -392,10 +397,13 @@ class MainWindow(QMainWindow):
             self.status.setText(f"Done in {took}")
             self._show_outputs(Path(ev["job_dir"]))
             self._update_reading()
-            for key in ("story", "summary", "notes"):  # most specific output first
-                if key in self.settings.outputs and (Path(ev["job_dir"]) / f"{key}.md").exists():
-                    self.tabs.setCurrentWidget(self.views[key])
-                    break
+            if self.tabs.isTabVisible(self.tabs.indexOf(self.translated)) and self.translated.toPlainText():
+                self.tabs.setCurrentWidget(self.translated)  # the translation was asked for: show it
+            else:
+                for key in ("story", "summary", "notes"):  # most specific output first
+                    if key in self.settings.outputs and (Path(ev["job_dir"]) / f"{key}.md").exists():
+                        self.tabs.setCurrentWidget(self.views[key])
+                        break
         elif kind == "cancelled":
             self.status.setText("Stopped. Finished parts are saved; press Start to resume.")
         elif kind == "error":
@@ -423,13 +431,32 @@ class MainWindow(QMainWindow):
                 view.setMarkdown(path.read_text(encoding="utf-8"))
             else:
                 view.clear()
+        path = self._translation_path(root)
+        if path:
+            self.translated.setMarkdown(path.read_text(encoding="utf-8"))
+        else:
+            self.translated.clear()
         self._refresh_tabs()
+
+    def _translation_path(self, root):
+        """The translated story in ``root``: the selected language first, else any that exists."""
+        if root is None:
+            return None
+        codes = dict.fromkeys([self.settings.translate_to, *translator.LANGUAGES])
+        return next((p for code in codes if code in translator.LANGUAGES
+                     and (p := Path(root) / translator.output_name(code)).exists()), None)
 
     def _refresh_tabs(self):
         """Show an output's tab when it is selected or already exists for this file."""
         for key, view in self.views.items():
             exists = self.job_dir is not None and (Path(self.job_dir) / f"{key}.md").exists()
             self.tabs.setTabVisible(self.tabs.indexOf(view), key in self.settings.outputs or exists)
+        path = self._translation_path(self.job_dir)
+        code = path.name.split(".")[1] if path else self.settings.translate_to
+        wanted = self.settings.translate_to in translator.LANGUAGES and "story" in self.settings.outputs
+        index = self.tabs.indexOf(self.translated)
+        self.tabs.setTabVisible(index, wanted or path is not None)
+        self.tabs.setTabText(index, f"Story in {translator.language_name(code) or 'translation'}")
 
     def _update_reading(self):
         self.panel.set_reading(reading_summary(self.settings.outputs, self.duration,

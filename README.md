@@ -41,6 +41,15 @@ Captions and audio are kept in `Documents\LocalScribe\youtube\`, so the same lin
 without the network. This is the only feature that goes online; the transcript and the LLM
 still stay on your machine.
 
+**Story in Tamil**: tick **Translate to Tamil** next to the story's tone and length before
+pressing Start. As the last step of the job, the finished Engaging Story is translated sentence
+by sentence and saved next to the English one as `story.ta.md` (shown in its own **Story in
+Tamil** tab). It runs offline with Meta's NLLB-200 (distilled 1.3B) on the GPU: about a minute
+for a 15-minute story on a GTX 1650. Headings, the logline and the narration are translated;
+character names in the cast list and the technical details line stay as written. This is
+machine translation: expect the odd wrong word, and a name or role is not always rendered the
+same way twice. Only the story is translated, not the summary or study notes.
+
 - Transcription: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (`large-v3-turbo` by default) on the GPU, CPU fallback
 - Speakers ("who said what"): [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with pyannote segmentation-3.0 + TitaNet-small embeddings, ONNX on the CPU; no PyTorch, no account
 - Writing: any GGUF instruct model through [llama.cpp](https://github.com/abetlen/llama-cpp-python), split across GPU and CPU when it does not fit in VRAM
@@ -71,6 +80,9 @@ PySide6 window ──start/cancel──► worker process (spawned)
                                      outline (title, logline, genre, cast) → story/outline.json
                                      script written part by part with "story so far" and the
                                      previous part's ending → story/part_NN.json → story.md
+   7. translate   translator.py  (optional) unload the LLM, NLLB-200 via CTranslate2 translates
+                                 story.md sentence by sentence → story/translation_ta.json
+                                 (resume point) → story.ta.md
 ```
 
 Each input file gets a job folder: `Documents\LocalScribe\jobs\<name>-<hash>\` containing
@@ -88,6 +100,7 @@ rewrites only the script.
 | `localscribe/diarizer.py` | Speaker detection (sherpa-onnx) and segment labelling |
 | `localscribe/summarizer.py` | llama.cpp backend, VRAM-aware layer offload, summary/notes map-reduce |
 | `localscribe/story.py` | Engaging Story: beats, outline, part-by-part narrator script |
+| `localscribe/translator.py` | Story translation (Tamil): NLLB-200 through CTranslate2, Markdown-preserving, resumable |
 | `localscribe/prompts.py` | Prompts and JSON schemas |
 | `localscribe/config.py` | Settings, outputs, content-type presets, story tones and lengths |
 | `localscribe/jobs.py` | Job folders, manifest, atomic writes |
@@ -109,6 +122,9 @@ Models (one-time downloads):
 - Whisper `large-v3-turbo` (1.6 GB) downloads automatically on first run into the Hugging Face cache.
 - Speaker models (~47 MB) download automatically the first time speakers are detected, into
   `Documents\LocalScribe\models\diarization`.
+- Translation model NLLB-200 distilled 1.3B (1.3 GB) downloads automatically the first time a
+  story is translated, into `Documents\LocalScribe\models\translation`. Its licence is
+  CC-BY-NC 4.0: non-commercial use only.
 - LLM: put a GGUF instruct model in `Documents\LocalScribe\models\` and select it in
   **Settings**. Tested with `Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf` (4.9 GB).
 
@@ -121,6 +137,7 @@ python -m localscribe run lecture.mp3 --preset lecture  # summary + study notes
 python -m localscribe run episode.mp3 --preset podcast  # summary, speakers labelled
 python -m localscribe run film.mkv --preset movie --tone suspense --minutes 15
 python -m localscribe run film.srt --minutes 30         # story straight from subtitles, no Whisper
+python -m localscribe run film.srt --translate ta       # ... and the story in Tamil as well
 python -m localscribe run course.vtt --outputs summary,notes
 python -m localscribe run "https://youtu.be/aircAruvnKk" --outputs summary  # from the video's captions
 python -m localscribe run talk.mp3 --outputs summary,story --speakers 2
@@ -145,7 +162,8 @@ python -m pytest -q
 
 The tests use fake Whisper/diarizer/LLM backends (`tests/fakes.py`) plus real audio decoding, and
 cover chunk planning, transcript formats, subtitle parsing, speaker labelling, field-selective
-map-reduce, story parts and caching, presets, cancel → resume, and cache invalidation.
+map-reduce, story parts and caching, presets, cancel → resume, cache invalidation, YouTube
+links (with a fake downloader) and story translation (with a fake translator).
 
 ## Troubleshooting
 
