@@ -3,7 +3,7 @@ import argparse
 import sys
 import threading
 
-from localscribe import __version__
+from localscribe import __version__, youtube
 from localscribe.config import OUTPUTS, PRESETS, STORY_TONES, load_settings, story_minutes
 from localscribe.subtitles import is_subtitle
 from localscribe.timefmt import hms
@@ -36,6 +36,9 @@ def _cmd_run(args) -> int:
     elif args.outputs is None and is_subtitle(args.file):
         settings.apply_preset("movie")  # subtitles default to the Engaging Story
         print("Subtitle file: using the movie preset (Engaging Story); pass --outputs to change.")
+    elif args.outputs is None and youtube.is_url(args.file) and "summary" not in settings.outputs:
+        settings.apply_preset("lecture")  # a YouTube link is summarized
+        print("YouTube link: using the lecture preset (summary + study notes); pass --outputs to change.")
     for attr, value in (("whisper_model", args.whisper_model), ("llm_path", args.llm),
                         ("chunk_minutes", args.chunk_minutes), ("output_dir", args.output),
                         ("device", args.device), ("batch_size", args.batch_size),
@@ -73,6 +76,9 @@ def _cmd_run(args) -> int:
         cancel.set()
         print("\nStopped. Finished parts are saved; run the same command again to resume.")
         return 130
+    except youtube.YouTubeError as exc:
+        print(f"\n{exc}")
+        return 1
     return 0
 
 
@@ -88,7 +94,8 @@ def main(argv=None) -> int:
     sub.add_parser("gui", help="open the desktop app (default)")
     sub.add_parser("info", help="show detected hardware and settings")
     run = sub.add_parser("run", help="transcribe one file and produce the selected outputs")
-    run.add_argument("file", help="audio/video file, or .srt/.vtt subtitles (skips transcription)")
+    run.add_argument("file", help="audio/video file, .srt/.vtt subtitles (skips transcription), or a "
+                                  "YouTube link (uses its captions; without any, downloads the audio)")
     run.add_argument("--preset", choices=list(PRESETS),
                      help="lecture = summary + notes, podcast = summary, movie = Engaging Story")
     run.add_argument("--outputs", help=f"comma-separated, any of: {','.join(OUTPUTS)}")

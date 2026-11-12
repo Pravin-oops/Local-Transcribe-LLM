@@ -4,10 +4,11 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
-from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPlainTextEdit,
-                               QProgressBar, QPushButton, QTabWidget, QTextBrowser, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QPlainTextEdit, QProgressBar, QPushButton, QTabWidget, QTextBrowser, QVBoxLayout,
+                               QWidget)
 
-from localscribe import audio, models, subtitles
+from localscribe import audio, models, subtitles, youtube
 from localscribe.config import OUTPUTS, load_settings, models_dir, save_settings
 from localscribe.estimates import reading_summary
 from localscribe.jobs import Job, read_json
@@ -16,7 +17,7 @@ from localscribe.ui import theme
 from localscribe.ui.options_panel import OptionsPanel
 from localscribe.ui.settings_dialog import SettingsDialog
 from localscribe.ui.widgets import DropZone
-from localscribe.ui.worker import JobRunner, ModelDownload
+from localscribe.ui.worker import JobRunner, ModelDownload, YouTubeProbe
 
 FILE_FILTER = "Audio, video and subtitles ({});;Subtitles ({});;All files (*)".format(
     " ".join(f"*{ext}" for ext in audio.AUDIO_EXTENSIONS + subtitles.SUBTITLE_EXTENSIONS),
@@ -31,7 +32,10 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(900, 760)
         self.setAcceptDrops(True)
         self.settings = load_settings()
-        self.source = None
+        self.source = None     # a local file ...
+        self.url = None        # ... or a YouTube link (then self.video is what the lookup found)
+        self.video = None
+        self.probe = None
         self.duration = None
         self.job_dir = None
         self.started_at = None
@@ -61,6 +65,18 @@ class MainWindow(QMainWindow):
         # Drop zone and options
         self.drop = DropZone()
         self.drop.clicked.connect(self._choose_file)
+        self.link = QLineEdit()
+        self.link.setPlaceholderText("Or paste a YouTube link: its captions are summarized, no transcription needed")
+        self.link.setClearButtonEnabled(True)
+        self.link.textChanged.connect(self._link_edited)
+        self.link.returnPressed.connect(self._open_link)
+        self.link_btn = QPushButton("Check captions")
+        self.link_btn.setCursor(Qt.PointingHandCursor)
+        self.link_btn.clicked.connect(self._open_link)
+        link_row = QHBoxLayout()
+        link_row.setSpacing(10)
+        link_row.addWidget(self.link, 1)
+        link_row.addWidget(self.link_btn)
         self.panel = OptionsPanel(self.settings)
         self.panel.changed.connect(self._outputs_changed)
         self.panel.download_whisper.connect(self._download_whisper)
@@ -113,6 +129,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(14)
         layout.addLayout(header)
         layout.addWidget(self.drop)
+        layout.addLayout(link_row)
         layout.addWidget(self.panel)
         layout.addLayout(actions)
         layout.addWidget(self.progress)
@@ -126,7 +143,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ file selection
 
     def dragEnterEvent(self, event):
-        if not self.runner.is_running() and self._dropped_file(event):
+        if not self.runner.is_running() and (self._dropped_file(event) or self._dropped_link(event)):
             event.acceptProposedAction()
             self.drop.set_active(True)
 
@@ -135,9 +152,18 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event):
         self.drop.set_active(False)
-        path = self._dropped_file(event)
+        path, link = self._dropped_file(event), self._dropped_link(event)
         if path:
             self._open_source(path)
+        elif link:
+            self.link.setText(link)  # opens it through _link_edited
+
+    @staticmethod
+    def _dropped_link(event):
+        """A YouTube link dragged from a browser's address bar or page."""
+        mime = event.mimeData()
+        texts = [u.toString() for u in mime.urls()] + ([mime.text()] if mime.hasText() else [])
+        return next((t.strip() for t in texts if youtube.is_url(t)), None)
 
     @staticmethod
     def _dropped_file(event):
@@ -162,7 +188,98 @@ class MainWindow(QMainWindow):
             self.settings.apply_preset("movie")
             self.panel.load(self.settings)
             save_settings(self.settings)
+        self.url = self.video = None
+        self.link.blockSignals(True)
+        self.link.clear()
+        self.link.blockSignals(False)
         self._set_source(path)
+
+    # ------------------------------------------------------------------ YouTube link
+
+    def _link_edited(self, text: str):
+        """Open a pasted link straight away; typing still needs Enter or the button."""
+        vid = youtube.video_id(text)
+        if vid and youtube.watch_url(vid) != self.url:
+            self._open_link()
+
+    def _open_link(self):
+        """Look the video up: are there captions to summarize, or must the audio be transcribed?"""
+        if self.runner.is_running():
+            return
+        vid = youtube.video_id(self.link.text())
+        if not vid:
+            self.status.setText("That does not look like a YouTube video link")
+            return
+        if "summary" not in self.settings.outputs:  # a link is there to be summarized
+            self.settings.apply_preset("lecture")
+            self.panel.load(self.settings)
+            save_settings(self.settings)
+            self._refresh_tabs()
+        self.source, self.url, self.video = None, youtube.watch_url(vid), None
+        self._show_video()
+        self.status.setText("Checking YouTube for captions…")
+        self.probe = YouTubeProbe(self.url, self.settings.language, self)
+        self.probe.done.connect(self._probe_done)
+        self.probe.failed.connect(self._probe_failed)
+        self.probe.finished.connect(self.probe.deleteLater)
+        self.probe.start()
+
+    def _probe_done(self, url: str, info: dict):
+        if url != self.url:
+            return  # an answer for a link that has since been replaced
+        self.video = info
+        self._show_video()
+        self.status.setText("Captions found: ready to summarize" if info["captions"]
+                            else "No captions: Start will download the audio and transcribe it")
+
+    def _probe_failed(self, url: str, error: str):
+        if url != self.url:
+            return
+        self.video = {"error": error}
+        self._show_video()
+        self.status.setText("Could not check this link")
+
+    def _show_video(self):
+        """Describe the linked video in the drop zone: what was found and what Start will do."""
+        saved = youtube.cached(youtube.video_id(self.url), youtube.downloads_dir(self.settings.output_dir))
+        info = self.video or {}
+        self.duration = info.get("duration")
+        parts = ["YouTube"] + ([hms(self.duration)] if self.duration else [])
+        captions = saved.suffix.lower() == ".vtt" if saved else bool(info.get("captions"))
+        if saved:
+            parts.append("Captions saved earlier · transcription skipped" if captions
+                         else "Audio saved earlier: it will be transcribed")
+        elif captions:
+            parts.append(f"{youtube.CAPTION_KINDS[info['captions']].capitalize()} captions found"
+                         " · transcription skipped")
+        elif "error" in info:
+            parts.append(f"Could not check this link: {info['error']}")
+        elif self.video is None:
+            parts.append("Checking for captions…")
+        else:
+            parts.append("No captions: the audio will be downloaded and transcribed")
+        self.panel.set_audio_available(not captions)
+        resume = self._resume_hint(saved) if saved else ""
+        if resume:
+            parts.append(resume)
+        title = info.get("title") or (saved.stem.rsplit(" [", 1)[0] if saved else "YouTube video")
+        self.drop.set_file(title, " · ".join(parts))
+        if saved:
+            self._load_existing_outputs(saved)
+        else:
+            self.job_dir = None
+            self._show_outputs(Path(self.settings.output_dir) / "jobs" / "none")
+        self._update_reading()
+        self._set_busy(False)
+
+    def _refresh_source(self):
+        """Re-describe the current file or link after options or settings changed."""
+        if self.url:
+            self._show_video()
+        elif self.source:
+            self._set_source(self.source)
+        else:
+            self._update_reading()
 
     def _set_source(self, path: Path):
         self.source = path
@@ -213,7 +330,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ run control
 
     def _start(self):
-        if not self.source:
+        if not self.source and not self.url:
             self._choose_file()
             if not self.source:
                 return
@@ -233,7 +350,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.status.setText("Starting…")
         self.started_at = time.monotonic()
-        self.runner.start(str(self.source), self.settings.to_dict())
+        self.runner.start(self.url or str(self.source), self.settings.to_dict())
         self._set_busy(True)
 
     def _cancel(self):
@@ -242,8 +359,10 @@ class MainWindow(QMainWindow):
         self.status.setText("Stopping after the current step…")
 
     def _set_busy(self, busy: bool):
-        self.start_btn.setEnabled(not busy and self.source is not None)
+        self.start_btn.setEnabled(not busy and (self.source is not None or self.url is not None))
         self.drop.setEnabled(not busy)
+        self.link.setEnabled(not busy)
+        self.link_btn.setEnabled(not busy)
         self.settings_btn.setEnabled(not busy)
         self.panel.setEnabled(not busy)
         self.cancel_btn.setVisible(busy)
@@ -288,6 +407,8 @@ class MainWindow(QMainWindow):
                                  ev["message"] + "\n\nDetails are in the Log tab.")
 
     def _on_finished(self):
+        if self.url:
+            self._show_video()  # the captions or audio are saved now
         self._set_busy(False)
 
     def _show_outputs(self, root: Path):
@@ -355,10 +476,7 @@ class MainWindow(QMainWindow):
         self.panel.apply_to(self.settings)
         save_settings(self.settings)
         self._refresh_tabs()
-        if self.source:
-            self._set_source(self.source)
-        else:
-            self._update_reading()
+        self._refresh_source()
 
     def _open_settings(self):
         dialog = SettingsDialog(self.settings, self)
@@ -366,8 +484,7 @@ class MainWindow(QMainWindow):
             self.settings = dialog.result_settings()
             save_settings(self.settings)
             self.panel.refresh_models(self.settings)
-            if self.source:
-                self._set_source(self.source)
+            self._refresh_source()
 
     def _open_folder(self):
         if self.job_dir and Path(self.job_dir).exists():
@@ -383,4 +500,8 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             self.runner.shutdown()
+        for probe in self.findChildren(YouTubeProbe):  # a lookup still on the network must not outlive the window
+            if probe.isRunning():
+                probe.terminate()
+                probe.wait(1000)
         event.accept()

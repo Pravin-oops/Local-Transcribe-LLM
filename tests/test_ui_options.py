@@ -92,3 +92,41 @@ def test_opening_subtitles_selects_movie_preset_and_shows_reading_time(app, tmp_
     win.panel.chips["summary"].setChecked(True)   # a refresh keeps the user's choice
     assert "summary" in win.settings.outputs and "Summary" in win.panel.reading.text()
     win.close()
+
+
+def test_pasting_a_youtube_link_checks_captions_and_selects_a_summary(app, tmp_path, monkeypatch):
+    from localscribe.ui import main_window
+
+    class InstantProbe:
+        """The lookup, answered on the spot instead of over the network."""
+        def __init__(self, url, language, parent=None):
+            self.url = url
+            self.done = self.failed = self.finished = self
+        def connect(self, slot): self.slot = slot
+        def deleteLater(self): pass
+        def start(self): started.append(self.url)
+
+    started = []
+    monkeypatch.setattr(main_window, "YouTubeProbe", InstantProbe)
+    monkeypatch.setattr(main_window, "load_settings",
+                        lambda: Settings(output_dir=str(tmp_path / "out"), content_type="movie", outputs=["story"]))
+    monkeypatch.setattr(main_window, "save_settings", lambda s: None)
+    win = main_window.MainWindow()
+    assert not win.start_btn.isEnabled()
+    win.link.setText("https://youtu.be/aircAruvnKk?t=5")  # pasting is enough, no button needed
+    url = "https://www.youtube.com/watch?v=aircAruvnKk"
+    assert started == [url] and win.url == url and win.start_btn.isEnabled()
+    assert win.settings.outputs == ["summary", "notes"]  # a link is there to be summarized
+    assert win.drop.detail.text() == "YouTube · Checking for captions…"
+
+    win._probe_done(url, {"id": "aircAruvnKk", "title": "Neural networks", "duration": 1120, "captions": "auto"})
+    assert win.drop.title.text() == "Neural networks"
+    assert win.drop.detail.text() == "YouTube · 00:18:40 · Auto-generated captions found · transcription skipped"
+    assert not win.panel.speakers.isEnabled()
+
+    win._probe_done(url, {"id": "aircAruvnKk", "title": "Neural networks", "duration": 1120, "captions": ""})
+    assert win.drop.detail.text().endswith("No captions: the audio will be downloaded and transcribed")
+    assert win.panel.speakers.isEnabled()
+    win._probe_done("https://www.youtube.com/watch?v=otherVideo1", {"title": "Stale", "captions": "manual"})
+    assert win.drop.title.text() == "Neural networks"  # answers for a replaced link are ignored
+    win.close()

@@ -27,6 +27,20 @@ selected by default, other outputs still work). Names written in the subtitles (
 hearing-impaired sound cues such as `[thunder rumbling]` are kept as story context, never as
 dialogue. Speaker detection is unavailable for subtitles (it needs audio).
 
+**YouTube link**: paste a video link into the box under the drop zone (or drag it from the
+browser). LocalScribe checks the video for captions and shows what it found:
+
+- **Captions available** (the creator's own are preferred over auto-generated ones): they are
+  saved as the transcript and summarized straight away, with no download of the video and no
+  transcription. A one-hour lecture is ready for the LLM in a few seconds.
+- **No captions**: the smallest good audio track (~22 MB per hour) is downloaded and transcribed
+  with Whisper like any other file.
+
+A link selects the Lecture preset (Summary + Study notes) unless a summary is already ticked.
+Captions and audio are kept in `Documents\LocalScribe\youtube\`, so the same link resumes
+without the network. This is the only feature that goes online; the transcript and the LLM
+still stay on your machine.
+
 - Transcription: [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (`large-v3-turbo` by default) on the GPU, CPU fallback
 - Speakers ("who said what"): [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) with pyannote segmentation-3.0 + TitaNet-small embeddings, ONNX on the CPU; no PyTorch, no account
 - Writing: any GGUF instruct model through [llama.cpp](https://github.com/abetlen/llama-cpp-python), split across GPU and CPU when it does not fit in VRAM
@@ -40,6 +54,7 @@ PySide6 window ──start/cancel──► worker process (spawned)
       └──── events via mp.Queue ◄─────┤
                                       ▼
   pipeline.run_job
+   0. youtube     youtube.py     YouTube link: captions → .vtt (then skip to 4), else audio → 1
    0. subtitles   subtitles.py   .srt/.vtt input: parse and clean cues → segments, then skip to 4
    1. prepare     audio.py       PyAV decodes any audio/video → 16 kHz mono int16 PCM (memory-mapped)
                                  plan_chunks: ~10 min parts, cut at the quietest 0.5 s near each boundary
@@ -69,6 +84,7 @@ rewrites only the script.
 | `localscribe/audio.py` | Decoding (PyAV) and silence-aware chunk planning |
 | `localscribe/transcriber.py` | faster-whisper wrapper, hallucination and sound-tag filter |
 | `localscribe/subtitles.py` | `.srt`/`.vtt` input: encodings, markup, dash dialogue, names, sound cues |
+| `localscribe/youtube.py` | YouTube links (yt-dlp): caption lookup and parsing, audio fallback, saved downloads |
 | `localscribe/diarizer.py` | Speaker detection (sherpa-onnx) and segment labelling |
 | `localscribe/summarizer.py` | llama.cpp backend, VRAM-aware layer offload, summary/notes map-reduce |
 | `localscribe/story.py` | Engaging Story: beats, outline, part-by-part narrator script |
@@ -85,7 +101,7 @@ rewrites only the script.
 ```powershell
 conda activate local-llm
 conda install -c conda-forge cuda-cudart=12.4 libcublas=12.4 cudnn=9
-pip install pyside6 faster-whisper sherpa-onnx psutil pytest
+pip install pyside6 faster-whisper sherpa-onnx psutil yt-dlp pytest
 pip install llama-cpp-python --only-binary=:all: --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
 ```
 
@@ -106,6 +122,7 @@ python -m localscribe run episode.mp3 --preset podcast  # summary, speakers labe
 python -m localscribe run film.mkv --preset movie --tone suspense --minutes 15
 python -m localscribe run film.srt --minutes 30         # story straight from subtitles, no Whisper
 python -m localscribe run course.vtt --outputs summary,notes
+python -m localscribe run "https://youtu.be/aircAruvnKk" --outputs summary  # from the video's captions
 python -m localscribe run talk.mp3 --outputs summary,story --speakers 2
 python -m localscribe run lecture.mp3 --transcript-only --chunk-minutes 15
 python -m localscribe run lecture.mp3 --resummarize     # redo all LLM outputs
@@ -137,6 +154,8 @@ map-reduce, story parts and caching, presets, cancel → resume, and cache inval
 - **`DLL load failed while importing QtCore: The specified procedure could not be found`**:
   a conda-forge `icu` package shadows Windows' `icuuc.dll`. The app preloads the System32 copy
   (`_win_dlls.py`); scripts that import PySide6 directly should `import localscribe` first.
+- **A YouTube link fails with "Sign in to confirm" or a format error**: YouTube changes often;
+  update the downloader with `pip install -U yt-dlp`.
 - **Slow summaries or stories**: an 8B model on a 4 GB GPU runs partly on the CPU. Use a 3-4B
   model for speed, or lower **Context size** to 4096 so more layers fit on the GPU.
 - **Speakers merged or split**: automatic detection merges near-identical voices and tiny

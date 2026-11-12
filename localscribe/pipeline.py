@@ -5,6 +5,9 @@ Engaging Story), and every stage resumes from what is already on disk.
 Everything reports through ``emit(event: dict)`` so the same code drives the
 CLI and the desktop UI (where events cross a multiprocessing queue). Events:
 
+A YouTube link as the source is first turned into a local file by youtube.fetch
+(the video's captions, or its audio when it has none).
+
     {"type": "job", "job_dir"}
     {"type": "progress", "stage", "fraction", "message", "eta"}
     {"type": "segments", "items": [{"start", "end", "text"}, ...]}
@@ -19,7 +22,7 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
-from localscribe import audio, hardware, prompts, subtitles
+from localscribe import audio, hardware, prompts, subtitles, youtube
 from localscribe.subtitles import is_subtitle
 from localscribe.config import OUTPUTS, Settings
 from localscribe.jobs import Job, read_json, write_json_atomic
@@ -96,6 +99,11 @@ def _default_diarizer(samples, settings: Settings, on_progress, cancel, on_statu
 def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = False,
             transcriber_factory=None, backend_factory=None, diarizer_factory=None) -> dict:
     cancel = cancel or _NeverCancel()
+    fetched = url = None
+    if youtube.is_url(source):  # captions (or audio) become a local file, then the job runs as usual
+        url = youtube.watch_url(youtube.video_id(source))
+        fetched = _fetch_youtube(url, settings, emit, cancel)
+        source = fetched.path
     source = Path(source)
     if not source.is_file():
         raise FileNotFoundError(f"Audio file not found: {source}")
@@ -114,9 +122,13 @@ def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = F
     report.log_path = job.output("log.txt")
     emit({"type": "job", "job_dir": str(job.root)})
     report.log(f"Job started for {source} (outputs: {', '.join(outputs) or 'transcript only'})")
+    if fetched:
+        job.update_manifest(source_url=url)
+        for note in fetched.notes:
+            report.log(note)
 
     if from_subtitles:
-        segments = _read_subtitles(job, source, settings, report, emit)
+        segments = _read_subtitles(job, source, settings, report, emit, captions=fetched is not None)
     else:
         _prepare(job, source, settings, report, cancel)
         segments = _transcribe(job, settings, report, emit, cancel,
@@ -140,17 +152,37 @@ def run_job(source, settings: Settings, emit, cancel=None, resummarize: bool = F
     return result
 
 
-def _read_subtitles(job: Job, source: Path, settings: Settings, report: _Reporter, emit) -> list:
-    report.progress("prepare", 0.0, f"Reading subtitles {source.name}")
-    segments = subtitles.load(source)
+def _fetch_youtube(url: str, settings: Settings, emit, cancel):
+    """Captions or audio of a YouTube video as a local file (reused if fetched before)."""
+    def progress(message: str) -> None:
+        emit({"type": "progress", "stage": "fetch", "fraction": 0.0, "message": message, "eta": None})
+
+    try:
+        return youtube.fetch(url, youtube.downloads_dir(settings.output_dir), settings.language,
+                             progress, cancel)
+    except youtube.YouTubeError:
+        raise
+    except BaseException:
+        if cancel.is_set():  # yt-dlp's own "download cancelled" exception
+            raise Cancelled() from None
+        raise
+
+
+def _read_subtitles(job: Job, source: Path, settings: Settings, report: _Reporter, emit,
+                    captions: bool = False) -> list:
+    what = "YouTube captions" if captions else "Subtitles"
+    report.progress("prepare", 0.0, "Reading captions" if captions else f"Reading subtitles {source.name}")
+    # YouTube captions are plain speech; movie subtitles get dialogue and sound-cue cleanup.
+    segments = youtube.load_captions(source) if captions else subtitles.load(source)
     job.update_manifest(source_type="subtitles", duration=segments[-1]["end"])
     spoken = sum(1 for s in segments if not s.get("sound"))
-    report.log(f"Subtitles: {spoken} spoken lines, {len(segments) - spoken} sound cues, "
+    report.log(f"{what}: {spoken} spoken lines, {len(segments) - spoken} sound cues, "
                f"{hms(segments[-1]['end'])}; transcription skipped")
     if settings.diarize:
-        report.log("Speaker detection needs audio; using speaker names written in the subtitles instead")
+        report.log("Speaker detection needs audio; " + ("YouTube captions carry no speaker labels" if captions
+                   else "using speaker names written in the subtitles instead"))
     emit({"type": "segments", "items": segments})
-    report.progress("prepare", 1.0, "Subtitles loaded")
+    report.progress("prepare", 1.0, f"{what} loaded")
     return segments
 
 
@@ -325,8 +357,13 @@ def _llm_outputs(job: Job, source: Path, segments: list, settings: Settings, out
     report.log(f"LLM {backend.name}: context {backend.n_ctx}, GPU layers {getattr(backend, 'gpu_layers', '?')}")
     manifest = job.load_manifest()
     duration = manifest.get("duration", 0)
-    basis = ("From subtitles" if manifest.get("source_type") == "subtitles"
-             else f"Transcribed with {settings.whisper_model}")
+    if manifest.get("source_type") != "subtitles":
+        basis = f"Transcribed with {settings.whisper_model}"
+    elif manifest.get("source_url"):
+        kind = youtube.caption_kind(source)
+        basis = f"From {kind} YouTube captions" if kind else "From YouTube captions"
+    else:
+        basis = "From subtitles"
     # *...* rather than _..._: model names like Q4_K_M contain underscores.
     header = f"# {source.stem}\n\n*Duration {hms(duration)} · {basis} · Written by {backend.name}*\n\n"
 

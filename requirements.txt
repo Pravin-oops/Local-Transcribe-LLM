@@ -12,6 +12,7 @@ llama-cpp-python>=0.3.8
 numpy>=1.26
 psutil>=5.9
 huggingface_hub>=0.23
+yt-dlp>=2025.1           # YouTube links: captions, or audio when a video has none
 
 # dev
 pytest>=8

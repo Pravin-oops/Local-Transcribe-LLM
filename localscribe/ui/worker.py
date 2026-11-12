@@ -30,6 +30,24 @@ class ModelDownload(QThread):
         except Exception as exc:  # network, disk space, ...
             self.failed.emit(self.name, str(exc))
 
+
+class YouTubeProbe(QThread):
+    """Looks a YouTube link up (title, length, captions) off the UI thread."""
+    done = Signal(str, dict)
+    failed = Signal(str, str)
+
+    def __init__(self, url: str, language: str, parent=None):
+        super().__init__(parent)
+        self.url, self.language = url, language
+
+    def run(self):
+        try:
+            from localscribe import youtube
+            self.done.emit(self.url, youtube.probe(self.url, self.language))
+        except Exception as exc:  # no network, private or removed video, ...
+            self.failed.emit(self.url, str(exc))
+
+
 TERMINAL = ("done", "error", "cancelled")
 FORCE_STOP_MS = 20_000
 
